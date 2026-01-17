@@ -18,6 +18,7 @@ import requests
 import ssl
 import urllib3
 from typing import Dict, Optional
+from collections import deque
 
 # Suppress SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -67,6 +68,10 @@ class TradingBot:
         self.step_latencies = []            # Time between DONE and next market data
         self.order_send_times = {}          # order_id -> time sent
         self.fill_latencies = []            # Time between order and fill
+        # Track order rate compliance
+        self.order_history = deque()
+        self.order_limit_window = 50
+        self.order_limit_max = 1
     
     # =========================================================================
     # REGISTRATION - Get a token to start trading
@@ -199,7 +204,8 @@ class TradingBot:
             # =============================================
             order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
             
-            if order and self.order_ws and self.order_ws.sock:
+            #ADDED
+            if order and self.order_ws and self.order_ws.sock and self._can_send_order():
                 self._send_order(order)
             
             # Signal DONE to advance to next step
@@ -207,6 +213,21 @@ class TradingBot:
             
         except Exception as e:
             print(f"[{self.student_id}] Market data error: {e}")
+    
+    #ADDED
+    def regimeClassification(self, bid: float, ask: float, mid: float) -> str:
+        """
+        Example regime classification based on bid-ask spread.
+        """
+
+        #replace this to work with a model instead
+        spread = ask - bid
+        if spread < 0.1 * mid:
+            return "low_volatility"
+        elif spread < 0.3 * mid:
+            return "medium_volatility"
+        else:
+            return "high_volatility"
     
     # =========================================================================
     # YOUR STRATEGY - MODIFY THIS METHOD!
@@ -244,10 +265,6 @@ class TradingBot:
         # - Manage inventory by alternating buy/sell
         # =================================================================
         
-        # Only trade every 50 steps to avoid hitting order limits
-        if self.current_step % 50 != 0:
-            return None
-        
         # If we're too long, sell aggressively (hit the bid)
         if self.inventory > 200:
             return {"side": "SELL", "price": round(bid, 2), "qty": 100}
@@ -283,8 +300,17 @@ class TradingBot:
             self.order_send_times[order_id] = time.time()  # Track send time
             self.order_ws.send(json.dumps(msg))
             self.orders_sent += 1
+            self.order_history.append(self.current_step)
         except Exception as e:
             print(f"[{self.student_id}] Send order error: {e}")
+
+    def _can_send_order(self) -> bool:
+        window_start = self.current_step - self.order_limit_window
+        while self.order_history and self.order_history[0] <= window_start:
+            self.order_history.popleft()
+        allowed = len(self.order_history) < self.order_limit_max
+        print(f"[{self.student_id}] Can send order? {allowed} | recent={len(self.order_history)} window={self.order_limit_window}")
+        return allowed
     
     def _send_done(self):
         """Signal DONE to advance to the next simulation step."""
