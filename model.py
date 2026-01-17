@@ -5,10 +5,8 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
-# 1. Load Data
 df = pd.read_parquet("master_training_data.parquet")
 
-# 2. Filter out crashes (as you requested)
 df = df[~df['scenario'].str.contains("crash", case=False)].copy()
 
 # ==============================================================================
@@ -16,33 +14,20 @@ df = df[~df['scenario'].str.contains("crash", case=False)].copy()
 # ==============================================================================
 print("Generating features...")
 
-# We group by 'scenario' so rolling windows don't bleed between different runs
-# e.g., The end of 'normal' shouldn't affect the start of 'stressed'
 grouped = df.groupby('scenario')
 
-# A. Spread Dynamics
-# Relative spread is better than absolute (0.01 at price 10 is different than at price 1000)
 df['spread_rel'] = (df['ask'] - df['bid']) / df['mid']
 
-# B. Volatility (The most important feature)
-# Standard deviation of mid-price over the last 20 and 50 ticks
 df['vol_20'] = grouped['mid'].transform(lambda x: x.rolling(window=20).std())
 df['vol_50'] = grouped['mid'].transform(lambda x: x.rolling(window=50).std())
 
-# C. Momentum / Velocity
-# Absolute change in mid price from previous tick
 df['mid_change_abs'] = grouped['mid'].transform(lambda x: x.diff().abs())
-# Exponential Moving Average of price changes (Recent speed)
 df['velocity_ema'] = grouped['mid_change_abs'].transform(lambda x: x.ewm(span=20, adjust=False).mean())
 
-# D. Spread Stability
-# Is the spread widening? (Current spread vs 50-tick average)
 df['spread_ma_50'] = grouped['spread_rel'].transform(lambda x: x.rolling(window=50).mean())
 df['spread_ratio'] = df['spread_rel'] / df['spread_ma_50']
 
-# 3. Clean up NaNs created by rolling windows
-# (The first 50 rows of each scenario will be NaN)
-df = df.dropna()
+df = df.dropna().copy()
 
 # ==============================================================================
 # MODEL TRAINING
@@ -61,14 +46,46 @@ existing_cols_to_drop = [c for c in features_to_drop if c in df.columns]
 le = LabelEncoder()
 df["label"] = le.fit_transform(df["scenario"])
 
-X = df.drop(columns=existing_cols_to_drop + ["label"]) # Drop target too
-y = df["label"]
+# ------------------------------------------------------------------------------
+# SPLITTING STRATEGY: CHRONOLOGICAL (Prevents Leakage)
+# ------------------------------------------------------------------------------
+# We cannot use random shuffle (train_test_split) because rolling window features 
+# leak info from t-1 into t. If we shuffle, the model memorizes the neighbors.
+# We must split strictly by time: Train on first 75%, Test on last 25%.
+print("Splitting data chronologically (preventing time-series leakage)...")
 
-print(f"Training with features: {list(X.columns)}")
+X_train_list = []
+y_train_list = []
+X_test_list = []
+y_test_list = []
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.25, random_state=42, stratify=y
-)
+# We iterate through each scenario to ensure we get a 75/25 split for EACH type
+for scenario_name in df['scenario'].unique():
+    # Get all rows for this scenario, preserving time order
+    scenario_data = df[df['scenario'] == scenario_name]
+    
+    # Calculate split index
+    split_idx = int(len(scenario_data) * 0.75)
+    
+    # Split chronologically
+    train_subset = scenario_data.iloc[:split_idx]
+    test_subset = scenario_data.iloc[split_idx:]
+    
+    # Append to lists (dropping non-feature columns)
+    X_train_list.append(train_subset.drop(columns=existing_cols_to_drop + ["label"]))
+    y_train_list.append(train_subset["label"])
+    
+    X_test_list.append(test_subset.drop(columns=existing_cols_to_drop + ["label"]))
+    y_test_list.append(test_subset["label"])
+
+# Recombine into final sets
+X_train = pd.concat(X_train_list)
+y_train = pd.concat(y_train_list)
+X_test = pd.concat(X_test_list)
+y_test = pd.concat(y_test_list)
+
+print(f"Training on {len(X_train)} samples, Testing on {len(X_test)} samples.")
+print(f"Training with features: {list(X_train.columns)}")
 
 model = XGBClassifier(
     n_estimators=300,
@@ -93,7 +110,7 @@ print("="*40)
 print(classification_report(y_test, y_pred, target_names=le.classes_))
 
 print("\nFeature Importances:")
-importances = pd.Series(model.feature_importances_, index=X.columns)
+importances = pd.Series(model.feature_importances_, index=X_train.columns)
 print(importances.sort_values(ascending=False))
 
 # Optional: Save the model so your bot can load it
