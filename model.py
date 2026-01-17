@@ -125,5 +125,5 @@ importances = pd.Series(model.feature_importances_, index=X_train.columns)
 print(importances.sort_values(ascending=False))
 
 # Optional: Save the model so your bot can load it
-model.save_model("market_classifier.json")
-print("\nModel saved to market_classifier.json")
+model.save_model("market_classifier_crator.pkl")
+print("\nModel saved to market_classifier.pkl")
