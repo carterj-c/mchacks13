@@ -19,8 +19,10 @@ import ssl
 import urllib3
 import pickle
 import xgboost as xgb
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
 from collections import deque
+import math
+import os
 
 # Suppress SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -31,12 +33,6 @@ REGIME_SCENARIOS = (
     "hft_dominated",
 )
 
-REGIME_ID_MAP = {
-    0: "normal_market",
-    1: "stressed_market",
-    3: "hft_dominated",
-}
-
 INVENTORY_LIMIT = 5000
 RISK_UNWIND_THRESHOLD = 10
 RISK_UNWIND_MAX = 150
@@ -45,8 +41,6 @@ RISK_UNWIND_MAX = 150
 class TradingBot:
     """
     A trading bot that connects to the exchange simulator.
-
-    Students should modify the `decide_order()` method to implement their strategy.
     """
 
     def __init__(
@@ -56,7 +50,8 @@ class TradingBot:
         scenario: str,
         password: str = None,
         secure: bool = False,
-        regime_model_path: Optional[str] = None,
+        regime_model_path: Optional[str] = "market_classifier_crator.pkl",
+        regime_meta_path: Optional[str] = None,
     ):
         self.student_id = student_id
         self.host = host
@@ -72,12 +67,12 @@ class TradingBot:
         self.token = None
         self.run_id = None
 
-        # Trading state - track your position
-        self.inventory = 0  # Current position (positive = long, negative = short)
-        self.cash_flow = 0.0  # Cumulative cash from trades (negative when buying)
-        self.pnl = 0.0  # Mark-to-market PnL (cash_flow + inventory * mid_price)
-        self.current_step = 0  # Current simulation step
-        self.orders_sent = 0  # Number of orders sent
+        # Trading state
+        self.inventory = 0
+        self.cash_flow = 0.0
+        self.pnl = 0.0
+        self.current_step = 0
+        self.orders_sent = 0
 
         # Market data
         self.last_bid = 0.0
@@ -91,38 +86,63 @@ class TradingBot:
         self.running = True
 
         # Latency measurement
-        self.last_done_time = None  # When we sent DONE
-        self.step_latencies = []  # Time between DONE and next market data
-        self.order_send_times = {}  # order_id -> time sent
-        self.fill_latencies = []  # Time between order and fill
+        self.last_done_time = None
+        self.step_latencies = []
+        self.order_send_times = {}
+        self.fill_latencies = []
+
         # Track order rate compliance
         self.order_history = deque()
         self.order_limit_window = 50
         self.order_limit_max = 1
+
+        # Load model + metadata
         self.regime_model = self._load_regime_model(regime_model_path)
+        self._label_classes: Optional[List[str]] = None
+        self._feature_names: Optional[List[str]] = None
+
+        # If meta path not supplied, try common defaults next to model path
+        if regime_meta_path is None and regime_model_path:
+            candidates = []
+            base, _ = os.path.splitext(regime_model_path)
+            candidates.append(base + "_meta.pkl")
+            candidates.append(base + ".meta.pkl")
+            candidates.append("market_classifier_meta.pkl")
+            for c in candidates:
+                if os.path.exists(c):
+                    regime_meta_path = c
+                    break
+
+        self._load_regime_metadata(regime_meta_path)
+
         self.regime_strategy_map = {
             "normal_market": self._strategy_normal_market,
             "stressed_market": self._strategy_stressed_market,
             "hft_dominated": self._strategy_hft_dominated,
         }
 
+        # EXACT feature-engineering state (rolling/EMA)
+        self._mid_hist = deque(maxlen=60)         # supports rolling(50), rolling(20)
+        self._spread_rel_hist = deque(maxlen=60)  # supports rolling mean(50)
+        self._velocity_ema = None                # EMA(span=20, adjust=False)
+
     # =========================================================================
-    # REGISTRATION - Get a token to start trading
+    # REGISTRATION
     # =========================================================================
 
     def register(self) -> bool:
-        """Register with the server and get an auth token."""
         print(f"[{self.student_id}] Registering for scenario '{self.scenario}'...")
         try:
             url = f"{self.http_proto}://{self.host}/api/replays/{self.scenario}/start"
             headers = {"Authorization": f"Bearer {self.student_id}"}
             if self.password:
                 headers["X-Team-Password"] = self.password
+
             resp = requests.get(
                 url,
                 headers=headers,
                 timeout=10,
-                verify=not self.secure,  # Disable SSL verification for self-signed certs
+                verify=not self.secure
             )
 
             if resp.status_code != 200:
@@ -145,47 +165,34 @@ class TradingBot:
             return False
 
     # =========================================================================
-    # CONNECTION - Connect to WebSocket streams
+    # CONNECTION
     # =========================================================================
 
     def connect(self) -> bool:
-        """Connect to market data and order entry WebSockets."""
         try:
-            # SSL options for self-signed certificates
             sslopt = {"cert_reqs": ssl.CERT_NONE} if self.secure else None
 
-            # Market Data WebSocket
-            market_url = (
-                f"{self.ws_proto}://{self.host}/api/ws/market?run_id={self.run_id}"
-            )
+            market_url = f"{self.ws_proto}://{self.host}/api/ws/market?run_id={self.run_id}"
             self.market_ws = websocket.WebSocketApp(
                 market_url,
                 on_message=self._on_market_data,
                 on_error=self._on_error,
                 on_close=self._on_close,
-                on_open=lambda ws: print(f"[{self.student_id}] Market data connected"),
+                on_open=lambda ws: print(f"[{self.student_id}] Market data connected")
             )
 
-            # Order Entry WebSocket
             order_url = f"{self.ws_proto}://{self.host}/api/ws/orders?token={self.token}&run_id={self.run_id}"
             self.order_ws = websocket.WebSocketApp(
                 order_url,
                 on_message=self._on_order_response,
                 on_error=self._on_error,
                 on_close=self._on_close,
-                on_open=lambda ws: print(f"[{self.student_id}] Order entry connected"),
+                on_open=lambda ws: print(f"[{self.student_id}] Order entry connected")
             )
 
-            # Start WebSocket threads
-            threading.Thread(
-                target=lambda: self.market_ws.run_forever(sslopt=sslopt), daemon=True
-            ).start()
+            threading.Thread(target=lambda: self.market_ws.run_forever(sslopt=sslopt), daemon=True).start()
+            threading.Thread(target=lambda: self.order_ws.run_forever(sslopt=sslopt), daemon=True).start()
 
-            threading.Thread(
-                target=lambda: self.order_ws.run_forever(sslopt=sslopt), daemon=True
-            ).start()
-
-            # Wait for connections
             time.sleep(1)
             return True
 
@@ -194,39 +201,29 @@ class TradingBot:
             return False
 
     # =========================================================================
-    # MARKET DATA HANDLER - Called when new market data arrives
+    # MARKET DATA HANDLER
     # =========================================================================
 
     def _on_market_data(self, ws, message: str):
-        """Handle incoming market data snapshot."""
         try:
             recv_time = time.time()
             data = json.loads(message)
 
-            # Skip connection confirmation messages
             if data.get("type") == "CONNECTED":
                 return
 
-            # Measure step latency (time since we sent DONE)
             if self.last_done_time is not None:
-                step_latency = (recv_time - self.last_done_time) * 1000  # ms
+                step_latency = (recv_time - self.last_done_time) * 1000
                 self.step_latencies.append(step_latency)
 
-            # Extract market data
             self.current_step = data.get("step", 0)
             self.last_bid = data.get("bid", 0.0)
             self.last_ask = data.get("ask", 0.0)
 
-            # Log progress every 500 steps with latency stats
             if self.current_step % 500 == 0 and self.step_latencies:
-                avg_lat = sum(self.step_latencies[-100:]) / min(
-                    len(self.step_latencies), 100
-                )
-                print(
-                    f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms"
-                )
+                avg_lat = sum(self.step_latencies[-100:]) / min(len(self.step_latencies), 100)
+                print(f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms")
 
-            # Calculate mid price
             if self.last_bid > 0 and self.last_ask > 0:
                 self.last_mid = (self.last_bid + self.last_ask) / 2
             elif self.last_bid > 0:
@@ -239,111 +236,292 @@ class TradingBot:
             if self.last_mid > 0:
                 self.price_history.append(self.last_mid)
 
-            # =============================================
-            # YOUR STRATEGY LOGIC GOES HERE
-            # =============================================
             order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
 
-            # ADDED
-            if (
-                order
-                and self.order_ws
-                and self.order_ws.sock
-                and self._can_send_order()
-            ):
+            if order and self.order_ws and self.order_ws.sock and self._can_send_order():
                 self._send_order(order)
 
-            # Signal DONE to advance to next step
             self._send_done()
 
         except Exception as e:
             print(f"[{self.student_id}] Market data error: {e}")
 
+    # =========================================================================
+    # MODEL + META LOADING
+    # =========================================================================
+
     def _load_regime_model(self, path: Optional[str]):
-        """Attempt to load a pre-trained model for regime classification."""
         if not path:
+            print(f"[{self.student_id}] No regime model path provided.")
             return None
+
+        # Try loading as Booster model
         try:
             booster = xgb.Booster()
             booster.load_model(path)
-            print(f"[{self.student_id}] Loaded XGBoost model from {path}")
+            print(f"[{self.student_id}] Loaded XGBoost Booster model from {path}")
             return booster
         except Exception:
             pass
 
+        # Try pickled sklearn model (XGBClassifier or similar)
         try:
             with open(path, "rb") as f:
                 model = pickle.load(f)
             print(f"[{self.student_id}] Loaded pickled model from {path}")
+            # If it has classes_, use it
+            classes_ = getattr(model, "classes_", None)
+            if classes_ is not None:
+                try:
+                    self._label_classes = [str(x) for x in list(classes_)]
+                except Exception:
+                    pass
             return model
         except Exception as exc:
             print(f"[{self.student_id}] Regime model load failed: {exc}")
-        return None
+            return None
+
+    def _load_regime_metadata(self, meta_path: Optional[str]) -> None:
+        """
+        Recommended: save this from training:
+            meta = {"classes": list(le.classes_), "feature_names": list(X_train.columns)}
+            pickle.dump(meta, open("market_classifier_meta.pkl","wb"))
+        """
+        if not meta_path:
+            # If no meta, we'll fall back to a safe guess:
+            # LabelEncoder uses alphabetical order -> sorted(REGIME_SCENARIOS)
+            self._label_classes = self._label_classes or sorted(REGIME_SCENARIOS)
+            # And default feature order from our engineered feature vector
+            self._feature_names = self._feature_names or [
+                "spread_rel",
+                "vol_20",
+                "vol_50",
+                "mid_change_abs",
+                "velocity_ema",
+                "spread_ma_50",
+                "spread_ratio",
+            ]
+            print(f"[{self.student_id}] No meta file found. Using fallback label order: {self._label_classes}")
+            return
+
+        try:
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+            classes = meta.get("classes")
+            feats = meta.get("feature_names")
+            if classes and isinstance(classes, (list, tuple)):
+                self._label_classes = [str(x) for x in list(classes)]
+            if feats and isinstance(feats, (list, tuple)):
+                self._feature_names = [str(x) for x in list(feats)]
+
+            # Fill missing with safe defaults
+            self._label_classes = self._label_classes or sorted(REGIME_SCENARIOS)
+            self._feature_names = self._feature_names or [
+                "spread_rel",
+                "vol_20",
+                "vol_50",
+                "mid_change_abs",
+                "velocity_ema",
+                "spread_ma_50",
+                "spread_ratio",
+            ]
+
+            print(f"[{self.student_id}] Loaded metadata from {meta_path}")
+            print(f"[{self.student_id}] Label classes (id->name): {self._label_classes}")
+            print(f"[{self.student_id}] Feature order: {self._feature_names}")
+
+        except Exception as exc:
+            print(f"[{self.student_id}] Meta load failed ({meta_path}): {exc}")
+            self._label_classes = self._label_classes or sorted(REGIME_SCENARIOS)
+            self._feature_names = self._feature_names or [
+                "spread_rel",
+                "vol_20",
+                "vol_50",
+                "mid_change_abs",
+                "velocity_ema",
+                "spread_ma_50",
+                "spread_ratio",
+            ]
+
+    # =========================================================================
+    # BASIC HELPERS
+    # =========================================================================
 
     def _recent_momentum(self) -> float:
         if len(self.price_history) >= 2:
             return self.price_history[-1] - self.price_history[-2]
         return 0.0
 
-    def _build_regime_features(self, bid: float, ask: float, mid: float):
+    def _fallback_regime_guess(self, bid: float, ask: float, mid: float) -> str:
         spread = max(ask - bid, 0.0)
         momentum = self._recent_momentum()
-        volatility = 0.0
-        if len(self.price_history) >= 2:
-            diffs = [
-                abs(self.price_history[i + 1] - self.price_history[i])
-                for i in range(len(self.price_history) - 1)
-            ]
-            if diffs:
-                volatility = sum(diffs) / len(diffs)
-        return [bid, ask, mid, spread, momentum, volatility]
-
-    def _fallback_regime_guess(self, features):
-        mid = features[2]
-        spread = features[3]
-        momentum = features[4]
         if mid <= 0:
             return "normal_market"
         if spread > 0.05 * mid:
             return "stressed_market"
         if abs(momentum) > 0.015 * mid:
-            return "flash_crash" if momentum < 0 else "hft_dominated"
+            return "hft_dominated" if momentum > 0 else "stressed_market"
         if spread > 0.02 * mid:
             return "stressed_market"
-        return "mini_flash_crash" if abs(momentum) > 0.005 * mid else "normal_market"
-
-    def _resolve_regime_label(self, prediction):
-        label = str(prediction).strip()
-        if label in self.regime_strategy_map:
-            return label
-        try:
-            idx = int(float(prediction))
-            return REGIME_ID_MAP.get(idx, "normal_market")
-        except Exception:
-            return "normal_market"
-
-    def _predict_regime(self, features):
-        model = self.regime_model
-        if isinstance(model, xgb.Booster):
-            dmatrix = xgb.DMatrix([features])
-            return model.predict(dmatrix)[0]
-        predict_fn = getattr(model, "predict", None)
-        if callable(predict_fn):
-            return predict_fn([features])[0]
-        raise TypeError("Unsupported regime model type")
-
-    def classify_regime(self, bid: float, ask: float, mid: float) -> str:
-        features = self._build_regime_features(bid, ask, mid)
-        if self.regime_model:
-            try:
-                prediction = self._predict_regime(features)
-                return self._resolve_regime_label(prediction)
-            except Exception as exc:
-                print(f"[{self.student_id}] Regime classification failed: {exc}")
-        return self._fallback_regime_guess(features)
+        return "normal_market"
 
     # =========================================================================
-    # YOUR STRATEGY - MODIFY THIS METHOD!
+    # EXACT FEATURE ENGINEERING (online)
+    # ==========================================================================
+
+    def _rolling_std(self, values, window: int) -> Optional[float]:
+        if len(values) < window:
+            return None
+        # Match pandas rolling.std default ddof=1
+        arr = list(values)[-window:]
+        n = len(arr)
+        if n <= 1:
+            return 0.0
+        mean = sum(arr) / n
+        var = sum((x - mean) ** 2 for x in arr) / (n - 1)
+        return math.sqrt(var)
+
+    def _rolling_mean(self, values, window: int) -> Optional[float]:
+        if len(values) < window:
+            return None
+        arr = list(values)[-window:]
+        return sum(arr) / window
+
+    def _update_engineered_state_and_get_features(
+        self, bid: float, ask: float, mid: float
+    ) -> Optional[Dict[str, float]]:
+        """
+        EXACT training logic:
+          spread_rel   = (ask - bid) / mid
+          vol_20       = rolling std(mid, 20)
+          vol_50       = rolling std(mid, 50)
+          mid_change_abs = abs(diff(mid))
+          velocity_ema   = ewm(span=20, adjust=False).mean(mid_change_abs)
+          spread_ma_50   = rolling mean(spread_rel, 50)
+          spread_ratio   = spread_rel / spread_ma_50
+        """
+        if mid <= 0:
+            return None
+
+        spread_rel = (ask - bid) / mid
+
+        prev_mid = self._mid_hist[-1] if self._mid_hist else None
+        self._mid_hist.append(mid)
+        self._spread_rel_hist.append(spread_rel)
+
+        mid_change_abs = 0.0
+        if prev_mid is not None:
+            mid_change_abs = abs(mid - prev_mid)
+
+        # EMA(span=20, adjust=False): alpha = 2/(span+1)
+        alpha = 2.0 / (20.0 + 1.0)
+        if self._velocity_ema is None:
+            self._velocity_ema = mid_change_abs
+        else:
+            self._velocity_ema = alpha * mid_change_abs + (1.0 - alpha) * self._velocity_ema
+
+        vol_20 = self._rolling_std(self._mid_hist, 20)
+        vol_50 = self._rolling_std(self._mid_hist, 50)
+        spread_ma_50 = self._rolling_mean(self._spread_rel_hist, 50)
+
+        if vol_20 is None or vol_50 is None or spread_ma_50 is None:
+            return None
+        if spread_ma_50 == 0:
+            return None
+
+        spread_ratio = spread_rel / spread_ma_50
+
+        return {
+            "spread_rel": float(spread_rel),
+            "vol_20": float(vol_20),
+            "vol_50": float(vol_50),
+            "mid_change_abs": float(mid_change_abs),
+            "velocity_ema": float(self._velocity_ema),
+            "spread_ma_50": float(spread_ma_50),
+            "spread_ratio": float(spread_ratio),
+        }
+
+    # =========================================================================
+    # MODEL CALL (robust) + LABEL RESOLUTION (FIXED)
+    # =========================================================================
+
+    def _to_scalar(self, pred: Any) -> float:
+        # Handles numpy scalars, lists, nested arrays
+        try:
+            # If pred is array-like, peel layers
+            while isinstance(pred, (list, tuple)) and len(pred) == 1:
+                pred = pred[0]
+        except Exception:
+            pass
+        try:
+            # numpy array -> item()
+            if hasattr(pred, "shape") and hasattr(pred, "item") and getattr(pred, "shape", ()) != ():
+                if getattr(pred, "size", 1) == 1:
+                    return float(pred.item())
+        except Exception:
+            pass
+        try:
+            return float(pred)
+        except Exception:
+            return float("nan")
+
+    def _predict_regime_from_engineered_features(self, feats: Dict[str, float]) -> Any:
+        """
+        Builds vector in the SAME feature order as training (if meta present),
+        otherwise uses the default engineered order.
+        """
+        feature_names = self._feature_names or [
+            "spread_rel",
+            "vol_20",
+            "vol_50",
+            "mid_change_abs",
+            "velocity_ema",
+            "spread_ma_50",
+            "spread_ratio",
+        ]
+        vec = [feats[name] for name in feature_names]
+
+        model = self.regime_model
+        if model is None:
+            raise RuntimeError("No model loaded")
+
+        if isinstance(model, xgb.Booster):
+            dmatrix = xgb.DMatrix([vec], feature_names=feature_names)
+            pred = model.predict(dmatrix)
+            # pred may be array([class]) for softmax
+            return pred[0] if hasattr(pred, "__len__") else pred
+
+        predict_fn = getattr(model, "predict", None)
+        if callable(predict_fn):
+            return predict_fn([vec])[0]
+
+        raise TypeError("Unsupported regime model type")
+
+    def _resolve_regime_label(self, prediction: Any) -> str:
+        """
+        FIX: Do NOT use hardcoded REGIME_ID_MAP.
+        Use the exact LabelEncoder order from training if available (meta/classes_),
+        otherwise fallback to alphabetical LabelEncoder assumption: sorted(REGIME_SCENARIOS).
+        """
+        classes = self._label_classes or sorted(REGIME_SCENARIOS)
+
+        # If model directly outputs a string label, accept it
+        s = str(prediction).strip()
+        if s in self.regime_strategy_map:
+            return s
+
+        idx = int(self._to_scalar(prediction))
+        if 0 <= idx < len(classes):
+            label = classes[idx]
+            # If label includes other scenarios you didn't implement, map safely:
+            if label in self.regime_strategy_map:
+                return label
+
+        # Safe fallback
+        return "normal_market"
+
+    # =========================================================================
+    # YOUR STRATEGY
     # =========================================================================
 
     def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
@@ -358,17 +536,43 @@ class TradingBot:
         if risk_order:
             return risk_order
 
-        regime = self.classify_regime(bid, ask, mid)
+        engineered = self._update_engineered_state_and_get_features(bid, ask, mid)
+
+        # Not enough history for rolling(50): fallback until warm
+        if engineered is None:
+            regime = self._fallback_regime_guess(bid, ask, mid)
+            handler = self.regime_strategy_map.get(regime, self._strategy_normal_market)
+            # uncomment for debug:
+            # print(f"[{self.student_id}] warmup regime={regime}")
+            return handler(bid, ask, mid, regime)
+
+        regime = None
+        if self.regime_model is not None:
+            try:
+                pred = self._predict_regime_from_engineered_features(engineered)
+                regime = self._resolve_regime_label(pred)
+                # uncomment for debug:
+                # print(f"[{self.student_id}] pred={pred} -> regime={regime} feats={engineered}")
+            except Exception as exc:
+                print(f"[{self.student_id}] Regime classification failed: {exc}")
+
+        if not regime:
+            regime = self._fallback_regime_guess(bid, ask, mid)
+
         handler = self.regime_strategy_map.get(regime, self._strategy_normal_market)
+        # Print occasionally to avoid spam
+        if self.current_step % 200 == 0:
+            print(f"[{self.student_id}] Regime: {regime}")
         return handler(bid, ask, mid, regime)
 
+    # =========================================================================
+    # ORDER CREATION + RISK MGMT + STRATEGIES
+    # =========================================================================
+
     def _create_order(self, side: str, price: float, qty: int) -> Dict:
-        """Normalize order price and quantity for submission."""
         return {"side": side, "price": round(max(price, 0.01), 2), "qty": qty}
 
-    def _risk_manage_inventory(
-        self, bid: float, ask: float, mid: float
-    ) -> Optional[Dict]:
+    def _risk_manage_inventory(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
         exposure = self.inventory
         if abs(exposure) <= RISK_UNWIND_THRESHOLD:
             return None
@@ -383,9 +587,7 @@ class TradingBot:
         price = min(ask + 0.01, ask + 0.03)
         return self._create_order("BUY", price, qty)
 
-    def _strategy_normal_market(
-        self, bid: float, ask: float, mid: float, regime: str
-    ) -> Optional[Dict]:
+    def _strategy_normal_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
         momentum = self._recent_momentum()
         threshold = 0.0025 * mid
         if abs(momentum) < threshold:
@@ -401,9 +603,7 @@ class TradingBot:
         price = max(bid - small_tick, bid - 0.05)
         return self._create_order("SELL", price, qty)
 
-    def _strategy_stressed_market(
-        self, bid: float, ask: float, mid: float, regime: str
-    ) -> Optional[Dict]:
+    def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
         momentum = self._recent_momentum()
         if abs(momentum) < 0.01 * mid:
             return None
@@ -418,9 +618,7 @@ class TradingBot:
         price = max(bid - small_tick, bid - 0.03)
         return self._create_order("SELL", price, qty)
 
-    def _strategy_hft_dominated(
-        self, bid: float, ask: float, mid: float, regime: str
-    ) -> Optional[Dict]:
+    def _strategy_hft_dominated(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
         momentum = self._recent_momentum()
         if abs(momentum) < 0.0015 * mid:
             return None
@@ -440,18 +638,10 @@ class TradingBot:
     # =========================================================================
 
     def _send_order(self, order: Dict):
-        """Send an order to the exchange."""
         order_id = f"ORD_{self.student_id}_{self.current_step}_{self.orders_sent}"
-
-        msg = {
-            "order_id": order_id,
-            "side": order["side"],
-            "price": order["price"],
-            "qty": order["qty"],
-        }
-
+        msg = {"order_id": order_id, "side": order["side"], "price": order["price"], "qty": order["qty"]}
         try:
-            self.order_send_times[order_id] = time.time()  # Track send time
+            self.order_send_times[order_id] = time.time()
             self.order_ws.send(json.dumps(msg))
             self.orders_sent += 1
             self.order_history.append(self.current_step)
@@ -463,21 +653,16 @@ class TradingBot:
         while self.order_history and self.order_history[0] <= window_start:
             self.order_history.popleft()
         allowed = len(self.order_history) < self.order_limit_max
-        print(
-            f"[{self.student_id}] Can send order? {allowed} | recent={len(self.order_history)} window={self.order_limit_window}"
-        )
         return allowed
 
     def _send_done(self):
-        """Signal DONE to advance to the next simulation step."""
         try:
             self.order_ws.send(json.dumps({"action": "DONE"}))
-            self.last_done_time = time.time()  # Track when we sent DONE
-        except:
+            self.last_done_time = time.time()
+        except Exception:
             pass
 
     def _on_order_response(self, ws, message: str):
-        """Handle order responses and fills."""
         try:
             recv_time = time.time()
             data = json.loads(message)
@@ -488,32 +673,25 @@ class TradingBot:
 
             elif msg_type == "FILL":
                 qty = data.get("qty", 0)
-                price = data.get("price", 0)
+                price = data.get("price", 0.0)
                 side = data.get("side", "")
                 order_id = data.get("order_id", "")
 
-                # Measure fill latency
                 if order_id in self.order_send_times:
-                    fill_latency = (
-                        recv_time - self.order_send_times[order_id]
-                    ) * 1000  # ms
+                    fill_latency = (recv_time - self.order_send_times[order_id]) * 1000
                     self.fill_latencies.append(fill_latency)
                     del self.order_send_times[order_id]
 
-                # Update inventory and cash flow
                 if side == "BUY":
                     self.inventory += qty
-                    self.cash_flow -= qty * price  # Spent cash to buy
+                    self.cash_flow -= qty * price
                 else:
                     self.inventory -= qty
-                    self.cash_flow += qty * price  # Received cash from selling
+                    self.cash_flow += qty * price
 
-                # Calculate mark-to-market PnL using mid price
                 self.pnl = self.cash_flow + self.inventory * self.last_mid
 
-                print(
-                    f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}"
-                )
+                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}")
 
             elif msg_type == "ERROR":
                 print(f"[{self.student_id}] ERROR: {data.get('message')}")
@@ -538,16 +716,11 @@ class TradingBot:
     # =========================================================================
 
     def run(self):
-        """Main entry point - register, connect, and run."""
-        # Step 1: Register
         if not self.register():
             return
-
-        # Step 2: Connect
         if not self.connect():
             return
 
-        # Step 3: Run until complete
         print(f"[{self.student_id}] Running... Press Ctrl+C to stop")
         try:
             while self.running:
@@ -566,22 +739,17 @@ class TradingBot:
             print(f"  Inventory: {self.inventory}")
             print(f"  PnL: {self.pnl:.2f}")
 
-            # Print latency statistics
             if self.step_latencies:
                 print(f"\n  Step Latency (ms):")
                 print(f"    Min: {min(self.step_latencies):.1f}")
                 print(f"    Max: {max(self.step_latencies):.1f}")
-                print(
-                    f"    Avg: {sum(self.step_latencies) / len(self.step_latencies):.1f}"
-                )
+                print(f"    Avg: {sum(self.step_latencies)/len(self.step_latencies):.1f}")
 
             if self.fill_latencies:
                 print(f"\n  Fill Latency (ms):")
                 print(f"    Min: {min(self.fill_latencies):.1f}")
                 print(f"    Max: {max(self.fill_latencies):.1f}")
-                print(
-                    f"    Avg: {sum(self.fill_latencies) / len(self.fill_latencies):.1f}"
-                )
+                print(f"    Avg: {sum(self.fill_latencies)/len(self.fill_latencies):.1f}")
 
 
 # =============================================================================
@@ -596,22 +764,19 @@ if __name__ == "__main__":
 Examples:
   Local server:
     python student_algorithm.py --name team_alpha --password secret123 --scenario normal_market
-    
+
   Deployed server (HTTPS):
     python student_algorithm.py --name team_alpha --password secret123 --scenario normal_market --host 3.98.52.120:8433 --secure
-        """,
+        """
     )
 
     parser.add_argument("--name", required=True, help="Your team name")
     parser.add_argument("--password", required=True, help="Your team password")
     parser.add_argument("--scenario", default="normal_market", help="Scenario to run")
     parser.add_argument("--host", default="localhost:8080", help="Server host:port")
-    parser.add_argument(
-        "--secure", action="store_true", help="Use HTTPS/WSS (for deployed servers)"
-    )
-    parser.add_argument(
-        "--regime-model", help="Path to a pretrained regime classification model"
-    )
+    parser.add_argument("--secure", action="store_true", help="Use HTTPS/WSS (for deployed servers)")
+    parser.add_argument("--regime-model", default="market_classifier_crator.pkl", help="Path to a pretrained regime classification model")
+    parser.add_argument("--regime-meta", default=None, help="Path to metadata pickle (classes + feature_names) from training")
     args = parser.parse_args()
 
     bot = TradingBot(
@@ -621,6 +786,7 @@ Examples:
         password=args.password,
         secure=args.secure,
         regime_model_path=args.regime_model,
+        regime_meta_path=args.regime_meta,
     )
-
+    
     bot.run()
