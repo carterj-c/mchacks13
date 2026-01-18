@@ -90,6 +90,71 @@ export default function Dashboard() {
             <li>Emphasis on stability and interpretability</li>
           </ul>
 
+          <h4>Regime Feature Importances</h4>
+          <div className="table-container">
+            <h2>Classification Report</h2>
+            <table className="report-table">
+              <thead>
+                <tr>
+                  <th>Class</th>
+                  <th>Precision</th>
+                  <th>Recall</th>
+                  <th>F1-Score</th>
+                  <th>Support</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>hft_dominated</td><td>1.00</td><td>1.00</td><td>1.00</td><td>8750</td></tr>
+                <tr><td>normal_market</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1</td></tr>
+                <tr><td>stressed_market</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1677</td></tr>
+              </tbody>
+            </table>
+
+            <h2>Top 15 Feature Importances</h2>
+            <table className="importance-table">
+              <thead>
+                <tr>
+                  <th>Feature</th>
+                  <th>Importance Score</th>
+                  <th>Visual</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  { f: "spread_ma_1000", s: 0.206781 },
+                  { f: "vol_1000", s: 0.198098 },
+                  { f: "spread_ma_50", s: 0.176161 },
+                  { f: "spread_ma_200", s: 0.137116 },
+                  { f: "spread_ma_20", s: 0.125401 },
+                  { f: "vol_500", s: 0.101476 },
+                  { f: "velocity_ema_200", s: 0.043688 },
+                  { f: "spread_ma_500", s: 0.006340 },
+                  { f: "vol_20", s: 0.001274 },
+                  { f: "velocity_ema_20", s: 0.001107 },
+                  { f: "vol_50", s: 0.000936 },
+                  { f: "vol_200", s: 0.000587 },
+                  { f: "velocity_ema_50", s: 0.000381 },
+                  { f: "vol_shock_20_1000", s: 0.000167 },
+                  { f: "velocity_ema_500", s: 0.000136 },
+                ].map((item) => (
+                <tr key={item.f}>
+                  <td>{item.f}</td>
+                  <td>{item.s.toFixed(6)}</td>
+                  <td>
+                    <div className="bar-background">
+                      <div 
+                        className="importance-bar" 
+                        style={{ width: `${item.s * 100}%` }}
+                      ></div>
+                    </div>
+                  </td>
+                </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+
           <hr />
 
           <h3>Data Exploration</h3>
@@ -155,6 +220,7 @@ export default function Dashboard() {
             Interestingly sometimes the bots provided pure arbitrage opportunities as evidenced
             by the following chart:
           </p>
+          <img src="pure_arb.png" alt="" />
 
           <h3>Key Lesson</h3>
           <p>
