@@ -75,13 +75,6 @@ class TradingBot:
         self.current_step = 0
         self.orders_sent = 0
 
-        # -----------------------------
-        # Open order tracking (NEW)
-        # -----------------------------
-        self.max_open_orders = 50
-        # order_id -> {"side": str, "price": float, "remaining_qty": int, "step_sent": int}
-        self.open_orders: Dict[str, Dict[str, Any]] = {}
-
         # Market data
         self.last_bid = 0.0
         self.last_ask = 0.0
@@ -246,10 +239,8 @@ class TradingBot:
 
             order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
 
-            # NEW: Stop trading if open orders >= 50 until they fill
-            if self._can_place_new_order():
-                if order and self.order_ws and self.order_ws.sock and self._can_send_order():
-                    self._send_order(order)
+            if order and self.order_ws and self.order_ws.sock and self._can_send_order():
+                self._send_order(order)
 
             self._send_done()
 
@@ -374,10 +365,6 @@ class TradingBot:
         if spread > 0.02 * mid:
             return "stressed_market"
         return "normal_market"
-
-    # NEW: Can we place more orders? (open orders < 50)
-    def _can_place_new_order(self) -> bool:
-        return len(self.open_orders) < self.max_open_orders
 
     # =========================================================================
     # EXACT FEATURE ENGINEERING (online)
@@ -681,22 +668,10 @@ class TradingBot:
         msg = {"order_id": order_id, "side": order["side"], "price": order["price"], "qty": order["qty"]}
         try:
             self.order_send_times[order_id] = time.time()
-
-            # NEW: Track as open order until filled
-            self.open_orders[order_id] = {
-                "side": order["side"],
-                "price": order["price"],
-                "remaining_qty": int(order["qty"]),
-                "step_sent": int(self.current_step),
-            }
-
             self.order_ws.send(json.dumps(msg))
             self.orders_sent += 1
             self.order_history.append(self.current_step)
         except Exception as e:
-            # If send fails, remove from open orders tracking
-            if order_id in self.open_orders:
-                del self.open_orders[order_id]
             print(f"[{self.student_id}] Send order error: {e}")
 
     def _can_send_order(self) -> bool:
@@ -732,12 +707,6 @@ class TradingBot:
                     fill_latency = (recv_time - self.order_send_times[order_id]) * 1000
                     self.fill_latencies.append(fill_latency)
                     del self.order_send_times[order_id]
-
-                # NEW: decrement remaining qty for open order tracking
-                if order_id in self.open_orders:
-                    self.open_orders[order_id]["remaining_qty"] -= int(qty)
-                    if self.open_orders[order_id]["remaining_qty"] <= 0:
-                        del self.open_orders[order_id]
 
                 if side == "BUY":
                     self.inventory += qty
