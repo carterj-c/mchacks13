@@ -38,6 +38,12 @@ INVENTORY_LIMIT = 5000
 RISK_UNWIND_THRESHOLD = 10
 RISK_UNWIND_MAX = 150
 
+# NEW: Max number of open/resting orders allowed by exchange (your error was 50)
+MAX_OPEN_ORDERS = 50
+
+# Manual trader shows ticker field
+DEFAULT_TICKER = "SYM"
+
 
 class TradingBot:
     """
@@ -92,10 +98,14 @@ class TradingBot:
         self.order_send_times = {}
         self.fill_latencies = []
 
-        # Track order rate compliance
+        # Track order rate compliance (keep this!)
         self.order_history = deque()
         self.order_limit_window = 50
         self.order_limit_max = 1
+
+        # NEW: Open order tracking so we can cancel oldest
+        self.open_order_queue = deque()  # oldest -> newest order_ids
+        self.open_order_set = set()      # fast membership check
 
         # Load model + metadata
         self.regime_model = self._load_regime_model(regime_model_path)
@@ -223,7 +233,7 @@ class TradingBot:
 
             if self.current_step % 500 == 0 and self.step_latencies:
                 avg_lat = sum(self.step_latencies[-100:]) / min(len(self.step_latencies), 100)
-                print(f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms")
+                print(f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | Open: {len(self.open_order_set)} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms")
 
             if self.last_bid > 0 and self.last_ask > 0:
                 self.last_mid = (self.last_bid + self.last_ask) / 2
@@ -239,7 +249,9 @@ class TradingBot:
 
             order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
 
+            # If we want to send an order, cancel oldest orders first if needed
             if order and self.order_ws and self.order_ws.sock and self._can_send_order():
+                self._ensure_open_order_capacity(extra_needed=1)
                 self._send_order(order)
 
             self._send_done()
@@ -289,10 +301,7 @@ class TradingBot:
             pickle.dump(meta, open("market_classifier_meta.pkl","wb"))
         """
         if not meta_path:
-            # If no meta, we'll fall back to a safe guess:
-            # LabelEncoder uses alphabetical order -> sorted(REGIME_SCENARIOS)
             self._label_classes = self._label_classes or sorted(REGIME_SCENARIOS)
-            # And default feature order from our engineered feature vector
             self._feature_names = self._feature_names or [
                 "spread_rel",
                 "vol_20",
@@ -315,7 +324,6 @@ class TradingBot:
             if feats and isinstance(feats, (list, tuple)):
                 self._feature_names = [str(x) for x in list(feats)]
 
-            # Fill missing with safe defaults
             self._label_classes = self._label_classes or sorted(REGIME_SCENARIOS)
             self._feature_names = self._feature_names or [
                 "spread_rel",
@@ -373,7 +381,6 @@ class TradingBot:
     def _rolling_std(self, values, window: int) -> Optional[float]:
         if len(values) < window:
             return None
-        # Match pandas rolling.std default ddof=1
         arr = list(values)[-window:]
         n = len(arr)
         if n <= 1:
@@ -391,16 +398,6 @@ class TradingBot:
     def _update_engineered_state_and_get_features(
         self, bid: float, ask: float, mid: float
     ) -> Optional[Dict[str, float]]:
-        """
-        EXACT training logic:
-          spread_rel   = (ask - bid) / mid
-          vol_20       = rolling std(mid, 20)
-          vol_50       = rolling std(mid, 50)
-          mid_change_abs = abs(diff(mid))
-          velocity_ema   = ewm(span=20, adjust=False).mean(mid_change_abs)
-          spread_ma_50   = rolling mean(spread_rel, 50)
-          spread_ratio   = spread_rel / spread_ma_50
-        """
         if mid <= 0:
             return None
 
@@ -414,7 +411,6 @@ class TradingBot:
         if prev_mid is not None:
             mid_change_abs = abs(mid - prev_mid)
 
-        # EMA(span=20, adjust=False): alpha = 2/(span+1)
         alpha = 2.0 / (20.0 + 1.0)
         if self._velocity_ema is None:
             self._velocity_ema = mid_change_abs
@@ -447,15 +443,12 @@ class TradingBot:
     # =========================================================================
 
     def _to_scalar(self, pred: Any) -> float:
-        # Handles numpy scalars, lists, nested arrays
         try:
-            # If pred is array-like, peel layers
             while isinstance(pred, (list, tuple)) and len(pred) == 1:
                 pred = pred[0]
         except Exception:
             pass
         try:
-            # numpy array -> item()
             if hasattr(pred, "shape") and hasattr(pred, "item") and getattr(pred, "shape", ()) != ():
                 if getattr(pred, "size", 1) == 1:
                     return float(pred.item())
@@ -467,10 +460,6 @@ class TradingBot:
             return float("nan")
 
     def _predict_regime_from_engineered_features(self, feats: Dict[str, float]) -> Any:
-        """
-        Builds vector in the SAME feature order as training (if meta present),
-        otherwise uses the default engineered order.
-        """
         feature_names = self._feature_names or [
             "spread_rel",
             "vol_20",
@@ -489,7 +478,6 @@ class TradingBot:
         if isinstance(model, xgb.Booster):
             dmatrix = xgb.DMatrix([vec], feature_names=feature_names)
             pred = model.predict(dmatrix)
-            # pred may be array([class]) for softmax
             return pred[0] if hasattr(pred, "__len__") else pred
 
         predict_fn = getattr(model, "predict", None)
@@ -499,14 +487,8 @@ class TradingBot:
         raise TypeError("Unsupported regime model type")
 
     def _resolve_regime_label(self, prediction: Any) -> str:
-        """
-        FIX: Do NOT use hardcoded REGIME_ID_MAP.
-        Use the exact LabelEncoder order from training if available (meta/classes_),
-        otherwise fallback to alphabetical LabelEncoder assumption: sorted(REGIME_SCENARIOS).
-        """
         classes = self._label_classes or sorted(REGIME_SCENARIOS)
 
-        # If model directly outputs a string label, accept it
         s = str(prediction).strip()
         if s in self.regime_strategy_map:
             return s
@@ -514,11 +496,9 @@ class TradingBot:
         idx = int(self._to_scalar(prediction))
         if 0 <= idx < len(classes):
             label = classes[idx]
-            # If label includes other scenarios you didn't implement, map safely:
             if label in self.regime_strategy_map:
                 return label
 
-        # Safe fallback
         return "normal_market"
 
     # =========================================================================
@@ -539,12 +519,9 @@ class TradingBot:
 
         engineered = self._update_engineered_state_and_get_features(bid, ask, mid)
 
-        # Not enough history for rolling(50): fallback until warm
         if engineered is None:
             regime = self._fallback_regime_guess(bid, ask, mid)
             handler = self.regime_strategy_map.get(regime, self._strategy_normal_market)
-            # uncomment for debug:
-            # print(f"[{self.student_id}] warmup regime={regime}")
             return handler(bid, ask, mid, regime)
 
         regime = None
@@ -552,8 +529,6 @@ class TradingBot:
             try:
                 pred = self._predict_regime_from_engineered_features(engineered)
                 regime = self._resolve_regime_label(pred)
-                # uncomment for debug:
-                # print(f"[{self.student_id}] pred={pred} -> regime={regime} feats={engineered}")
             except Exception as exc:
                 print(f"[{self.student_id}] Regime classification failed: {exc}")
 
@@ -561,9 +536,10 @@ class TradingBot:
             regime = self._fallback_regime_guess(bid, ask, mid)
 
         handler = self.regime_strategy_map.get(regime, self._strategy_normal_market)
-        # Print occasionally to avoid spam
+
         if self.current_step % 200 == 0:
             print(f"[{self.student_id}] Regime: {regime}")
+
         return handler(bid, ask, mid, regime)
 
     # =========================================================================
@@ -576,67 +552,64 @@ class TradingBot:
     def _risk_manage_inventory(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
         exposure = self.inventory
 
-        # Only unwind if we're beyond the threshold
         if abs(exposure) <= RISK_UNWIND_THRESHOLD:
             return None
 
-        # How much we *want* to reduce (raw)
         desired_qty = min(abs(exposure) - RISK_UNWIND_THRESHOLD, RISK_UNWIND_MAX)
-
-        # Enforce lot size = 100
         qty = (desired_qty // 100) * 100
 
-        # If we can't make a valid lot, don't send anything
-        # (prevents invalid qty like 50, 60, 150, etc.)
         if qty < 100:
             return None
 
-        # If long -> sell to reduce
         if exposure > 0:
             price = max(bid - 0.01, 0.01)
             return self._create_order("SELL", price, qty)
 
-        # If short -> buy to reduce
         price = min(ask + 0.01, ask + 0.03)
         return self._create_order("BUY", price, qty)
 
+    def _strategy_normal_market(
+        self, bid: float, ask: float, mid: float, regime: str
+    ) -> Optional[Dict]:
+        """
+        Implementation of SPRAY AND PRAY
+        """
 
-    def _strategy_normal_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
-        momentum = self._recent_momentum()
-        threshold = 0.0025 * mid
-        if abs(momentum) < threshold:
+        # 2. Price Calculation (Adaptive Anti-Spiral)
+        # Check if we are already the top of book. If so, reinforce. If not, jump.
+        if abs(bid - self.my_last_bid) < 0.001:
+            my_bid = bid
+        else:
+            my_bid = round(bid + 0.01, 2)
+
+        if abs(ask - self.my_last_ask) < 0.001:
+            my_ask = ask
+        else:
+            my_ask = round(ask - 0.01, 2)
+
+        # Spread Safety
+        if my_bid >= my_ask:
             return None
 
-        small_tick = max(0.01, mid * 0.0005)
+        # 3. Execution (Alternating Fire)
+        self.flip_flop = not self.flip_flop
         qty = 100
 
-        if momentum > 0:
-            price = min(ask + small_tick, ask + 0.05)
-            return self._create_order("BUY", price, qty)
-
-        price = max(bid - small_tick, bid - 0.05)
-        return self._create_order("SELL", price, qty)
+        if self.flip_flop:
+            self.my_last_bid = my_bid
+            return self._create_order("BUY", my_bid, qty)
+        else:
+            self.my_last_ask = my_ask
+            return self._create_order("SELL", my_ask, qty)
 
     def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
-        """
-        The Goofy Gambler 3.0: Now with a strict 15,000-step budget.
-        """
-        # 1. THE AGGRESSIVE THROTTLE
-        # Only trade once every 300 steps. 
-        # 15,000 steps / 300 = 50 orders total. 
-        # This mathematically guarantees we NEVER hit the '50 open orders' error.
+        # Trade rarely in stressed mode
         if self.current_step % 300 != 0:
             return None
 
         qty = 100
-        
-        # 2. THE CHAOS SPREAD
-        # We want these to be "lottery tickets." 
-        # Offset is 0.5% to 2.0% away from mid.
         offset = mid * random.uniform(0.005, 0.02)
-        
-        # 3. SMART WEIGHTING
-        # If we have inventory, we try to exit it. If not, we flip a coin.
+
         if self.inventory > 0:
             side = "SELL"
             price = ask + offset
@@ -644,7 +617,6 @@ class TradingBot:
             side = "BUY"
             price = bid - offset
         else:
-            # No inventory? Flip for a direction!
             if random.random() > 0.5:
                 side = "BUY"
                 price = bid - offset
@@ -652,25 +624,80 @@ class TradingBot:
                 side = "SELL"
                 price = ask + offset
 
-        # Round to 2 decimals for the exchange
         return self._create_order(side, round(price, 2), qty)
 
     def _strategy_hft_dominated(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
-        
         return self._create_order("BUY", ask, 2000)
+
+    # =========================================================================
+    # ORDER CANCELLATION (NEW)
+    # =========================================================================
+
+    def _send_cancel(self, order_id: str) -> None:
+        """
+        Manual trader uses:
+          {"type": "CANCEL_ORDER", "order_id": "..."}
+        """
+        try:
+            if not (self.order_ws and self.order_ws.sock):
+                return
+            msg = {"type": "CANCEL_ORDER", "order_id": order_id}
+            self.order_ws.send(json.dumps(msg))
+        except Exception as e:
+            print(f"[{self.student_id}] Cancel send error: {e}")
+
+    def _ensure_open_order_capacity(self, extra_needed: int = 1) -> None:
+        """
+        If sending a new order would exceed MAX_OPEN_ORDERS,
+        cancel oldest orders until there is room.
+        """
+        target_max = MAX_OPEN_ORDERS - extra_needed
+        while len(self.open_order_set) > target_max and self.open_order_queue:
+            oldest_id = self.open_order_queue.popleft()
+            if oldest_id in self.open_order_set:
+                self.open_order_set.remove(oldest_id)
+                self._send_cancel(oldest_id)
+
+    def _mark_order_open(self, order_id: str) -> None:
+        if order_id not in self.open_order_set:
+            self.open_order_set.add(order_id)
+            self.open_order_queue.append(order_id)
+
+    def _mark_order_closed(self, order_id: str) -> None:
+        # remove from set; queue removal is lazy (we skip non-members later)
+        if order_id in self.open_order_set:
+            self.open_order_set.remove(order_id)
 
     # =========================================================================
     # ORDER HANDLING
     # =========================================================================
 
     def _send_order(self, order: Dict):
+        """
+        Sends order in the SAME schema as manual trader:
+          {"type":"NEW_ORDER","order_id":...,"ticker":"SYM",...}
+        Tracks the order_id as "open" so we can cancel oldest later.
+        """
         order_id = f"ORD_{self.student_id}_{self.current_step}_{self.orders_sent}"
-        msg = {"order_id": order_id, "side": order["side"], "price": order["price"], "qty": order["qty"]}
+        msg = {
+            "type": "NEW_ORDER",
+            "order_id": order_id,
+            "ticker": DEFAULT_TICKER,
+            "side": order["side"],
+            "price": order["price"],
+            "qty": order["qty"],
+        }
+
         try:
             self.order_send_times[order_id] = time.time()
             self.order_ws.send(json.dumps(msg))
+
             self.orders_sent += 1
             self.order_history.append(self.current_step)
+
+            # Mark as open immediately; if it fills instantly, we'll remove it on FILL
+            self._mark_order_open(order_id)
+
         except Exception as e:
             print(f"[{self.student_id}] Send order error: {e}")
 
@@ -678,8 +705,7 @@ class TradingBot:
         window_start = self.current_step - self.order_limit_window
         while self.order_history and self.order_history[0] <= window_start:
             self.order_history.popleft()
-        allowed = len(self.order_history) < self.order_limit_max
-        return allowed
+        return len(self.order_history) < self.order_limit_max
 
     def _send_done(self):
         try:
@@ -703,6 +729,10 @@ class TradingBot:
                 side = data.get("side", "")
                 order_id = data.get("order_id", "")
 
+                # If it filled, it is no longer open/resting
+                if order_id:
+                    self._mark_order_closed(order_id)
+
                 if order_id in self.order_send_times:
                     fill_latency = (recv_time - self.order_send_times[order_id]) * 1000
                     self.fill_latencies.append(fill_latency)
@@ -717,10 +747,22 @@ class TradingBot:
 
                 self.pnl = self.cash_flow + self.inventory * self.last_mid
 
-                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}")
+                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Open: {len(self.open_order_set)} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}")
+
+            # Many sims emit a cancel confirmation type - handle a few common ones
+            elif msg_type in ("CANCELLED", "CANCELED", "ORDER_CANCELLED", "CANCEL_CONFIRM"):
+                order_id = data.get("order_id", "")
+                if order_id:
+                    self._mark_order_closed(order_id)
 
             elif msg_type == "ERROR":
-                print(f"[{self.student_id}] ERROR: {data.get('message')}")
+                msg = data.get("message")
+                print(f"[{self.student_id}] ERROR: {msg}")
+
+                # If error indicates too many open orders, cancel a few immediately
+                # (This is defensive in case our tracking desyncs.)
+                if msg and "open orders" in str(msg).lower():
+                    self._ensure_open_order_capacity(extra_needed=1)
 
         except Exception as e:
             print(f"[{self.student_id}] Order response error: {e}")
@@ -762,6 +804,7 @@ class TradingBot:
 
             print(f"\n[{self.student_id}] Final Results:")
             print(f"  Orders Sent: {self.orders_sent}")
+            print(f"  Open Orders (tracked): {len(self.open_order_set)}")
             print(f"  Inventory: {self.inventory}")
             print(f"  PnL: {self.pnl:.2f}")
 
@@ -814,5 +857,5 @@ Examples:
         regime_model_path=args.regime_model,
         regime_meta_path=args.regime_meta,
     )
-    
+
     bot.run()
