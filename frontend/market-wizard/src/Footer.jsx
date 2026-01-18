@@ -6,15 +6,14 @@ function Footer() {
       style={{
         background: "#c8102e",
         color: "white",
-        width: "97.35%",
+        width: "100%",
         boxShadow: "0 -4px 12px rgba(0,0,0,0.2)",
         fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
         padding: "12px 20px",
-        position: "sticky",
-        bottom: 0,
-        zIndex: 1000,
+        boxSizing: "border-box",
       }}
     >
+
       <div style={{ textAlign: "center" }}>
         <h3 style={{ margin: 0 }}>Contributors</h3>
         <p style={{ margin: 0 }}>
