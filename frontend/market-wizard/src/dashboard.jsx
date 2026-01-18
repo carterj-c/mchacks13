@@ -148,7 +148,7 @@ export default function Dashboard() {
             After simulating the fill times and probabilties as a function of the price improvement over the bid/ask
             we get this trend for the normal regime:
           </p>
-          <img src="latencyAndPriceOffset.webp" alt="">
+          <img src="latencyAndPriceOffset.webp" alt="" />
 
           <h3>Key Lesson</h3>
           <p>
