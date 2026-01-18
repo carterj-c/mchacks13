@@ -8,22 +8,26 @@ from sklearn.metrics import classification_report
 # 1. Load Data
 df = pd.read_parquet("master_training_data.parquet")
 
-df = df[~df['scenario'].str.contains("crash", case=False)].copy()
+df = df[~df["scenario"].str.contains("crash", case=False)].copy()
 
 # 2. Pre-processing & Feature Engineering
 df = df[(df["bid"] > 0) & (df["ask"] > 0) & (df["mid"] > 0)].copy()
 
 # Group by scenario to ensure rolling windows stay within their own simulations
-grouped = df.groupby('scenario')
+grouped = df.groupby("scenario")
 
 # These features essentially "summarize" the group of rows leading up to the current tick
-df['vol_20'] = grouped['mid'].transform(lambda x: x.rolling(window=20).std())
-df['vol_50'] = grouped['mid'].transform(lambda x: x.rolling(window=50).std())
-df['spread_rel'] = (df['ask'] - df['bid']) / df['mid']
-df['mid_change_abs'] = grouped['mid'].transform(lambda x: x.diff().abs())
-df['velocity_ema'] = grouped['mid_change_abs'].transform(lambda x: x.ewm(span=20, adjust=False).mean())
-df['spread_ma_50'] = grouped['spread_rel'].transform(lambda x: x.rolling(window=50).mean())
-df['spread_ratio'] = df['spread_rel'] / df['spread_ma_50']
+df["vol_20"] = grouped["mid"].transform(lambda x: x.rolling(window=20).std())
+df["vol_50"] = grouped["mid"].transform(lambda x: x.rolling(window=50).std())
+df["spread_rel"] = (df["ask"] - df["bid"]) / df["mid"]
+df["mid_change_abs"] = grouped["mid"].transform(lambda x: x.diff().abs())
+df["velocity_ema"] = grouped["mid_change_abs"].transform(
+    lambda x: x.ewm(span=20, adjust=False).mean()
+)
+df["spread_ma_50"] = grouped["spread_rel"].transform(
+    lambda x: x.rolling(window=50).mean()
+)
+df["spread_ratio"] = df["spread_rel"] / df["spread_ma_50"]
 
 # 3. THE "GROUPING" STEP
 # Instead of keeping every row, we take every 50th row.
@@ -39,10 +43,19 @@ le = LabelEncoder()
 df_windowed["y"] = le.fit_transform(df_windowed["scenario"])
 
 # Drop columns that are specific to a single point in time or identifiers
-X = df_windowed.drop(columns=[
-    "scenario", "y", "timestamp", "step", 
-    "bid", "ask", "mid", "spread" # Drop raw prices to force behavior learning
-], errors='ignore')
+X = df_windowed.drop(
+    columns=[
+        "scenario",
+        "y",
+        "timestamp",
+        "step",
+        "bid",
+        "ask",
+        "mid",
+        "spread",  # Drop raw prices to force behavior learning
+    ],
+    errors="ignore",
+)
 
 y = df_windowed["y"]
 
@@ -58,24 +71,25 @@ X_train, X_test, y_train, y_test = train_test_split(
 # 6. XGBoost Model
 model = XGBClassifier(
     n_estimators=200,
-    max_depth=4, # Slightly shallower to prevent overfitting on specific windows
+    max_depth=4,  # Slightly shallower to prevent overfitting on specific windows
     learning_rate=0.1,
     subsample=0.8,
     colsample_bytree=0.8,
     objective="multi:softmax",
-    num_class=len(le.classes_)
+    num_class=len(le.classes_),
 )
 
 model.fit(X_train, y_train)
 
 # 7. Results
 y_pred = model.predict(X_test)
-print("\n" + "="*40)
+print("\n" + "=" * 40)
 print("WINDOWED CLASSIFICATION REPORT")
-print("="*40)
+print("=" * 40)
 print(classification_report(y_test, y_pred, target_names=le.classes_))
 
 # 8. Feature Importance (See what actually defines a "Normal" vs "HFT" market)
 importances = pd.Series(model.feature_importances_, index=X.columns)
 print("\nTop Predictors of Market Scenario:")
 print(importances.sort_values(ascending=False))
+
