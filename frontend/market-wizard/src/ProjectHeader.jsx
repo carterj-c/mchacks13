@@ -32,7 +32,7 @@ function ProjectHeader() {
             lineHeight: "1.4",
           }}
         >
-          McHacks 13
+          McHacks 13 - National Bank Challenge
         </p>
       </div>
     </header>

@@ -8,16 +8,16 @@ body {
   display: flex;
   width: 100%;
   color: #1f2933;
-  padding-top: 2.5%;
+  padding-top: 24px;
+  box-sizing: border-box;
+  overflow-x: hidden;
 }
 
 /* Sidebar */
 .sidebar {
-  background-color: none;
-  width: 220px;                 /* ✅ FIXED WIDTH */
-  padding: 10px;
-
-  flex-shrink: 0;               /* ✅ PREVENT COLLAPSE */
+  width: 220px;
+  flex-shrink: 0;
+  box-sizing: border-box;
 }
 
 .sidebar-title {
@@ -52,11 +52,20 @@ body {
 .content {
   flex: 1;
   min-width: 0;
+  box-sizing: border-box;
+  overflow-x: hidden;
 }
 
 /* Graph container */
 .graph-container {
-  display:flex;
+  width: 100%;
+  overflow-x: hidden;
+}
+
+.plot-wrapper {
+  width: 100%;
+  max-width: 90%;
+  overflow-x: hidden;
 }
 
 .graph {

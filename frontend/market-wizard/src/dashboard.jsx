@@ -29,9 +29,11 @@ export default function Dashboard() {
       </aside>
 
       <main className="content">
-        <div className="graph-container">
+      <div className="graph-container">
+        <div className="plot-wrapper">
           <MarketPlot market={activeGraph} />
         </div>
+      </div>
 
         {/* INSIGHTS SECTION */}
         <div className="insights">
@@ -45,7 +47,7 @@ export default function Dashboard() {
 
           <p>
             We streamed live bid/ask feeds, logged them, and trained regime classifiers to
-            detect the three dominant states — Normal, Stressed, and HFT — so each specialized
+            detect the three dominant states, Normal, Stressed, and HFT, so each specialized
             algorithm could be triggered only when its matching microstructure signature appeared.
           </p>
 
@@ -165,7 +167,7 @@ export default function Dashboard() {
 
           <p>
             Visual inspection revealed that each market regime exhibits a distinct
-            microstructure signature — spread behavior, volatility, and liquidity dynamics
+            microstructure signature; spread behavior, volatility, and liquidity dynamics
             differ far more than raw prices alone suggest.
           </p>
 
@@ -238,7 +240,7 @@ export default function Dashboard() {
 
           <p>
             <strong>HFT ALGO:</strong> Each time a new quote comes in, the algorithm computes the
-            current spread (ask − bid) and compares it to the last 3 spreads by calculating a
+            current spread (ask - bid) and compares it to the last 3 spreads by calculating a
             z-score: it finds the mean and standard deviation of those last 3 spreads, then
             measures how many “standard deviations” above normal the current spread is. If that
             z-score is above a threshold (meaning the spread is unusually wide), it assumes the
@@ -246,18 +248,18 @@ export default function Dashboard() {
             “expected spread move” based on how much wider than normal the spread is, and
             immediately places a tighter order inside the spread to capture that tightening: if it
             expects price to move up it sends a BUY at bid + expected_move (still below the ask),
-            and if it expects price to move down it sends a SELL at ask − expected_move (still above
+            and if it expects price to move down it sends a SELL at ask - expected_move (still above
             the bid), otherwise it does nothing.
           </p>
 
           <p>
             <strong>STRESSED ALGO:</strong> It keeps a slow “fair price” line (EMA) so it knows what
             “normal” should be, and it keeps a recent move/volatility estimate (ATR-style) so it knows
-            how crazy the market is right now and doesn’t overreact to small noise. When price gets
+            how crazy the market is right now and doesn't overreact to small noise. When price gets
             far enough away from fair, it starts placing a ladder of orders OUTSIDE the current
-            bid/ask (so it doesn’t tighten the spread and trick your regime detector into thinking
-            it’s HFT). It also uses a basic trend / direction check so it won’t keep buying while the
-            market is clearly dumping or keep selling while it’s ripping. Then when price comes back
+            bid/ask (so it doesn't tighten the spread and trick your regime detector into thinking
+            it's HFT). It also uses a basic trend / direction check so it won't keep buying while the
+            market is clearly dumping or keep selling while it's ripping. Then when price comes back
             closer to fair, it exits by selling at the bid / buying at the ask to actually get filled
             and reduce risk fast.
           </p>
