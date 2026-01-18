@@ -645,81 +645,192 @@ class TradingBot:
             # BUY at bid + 0.01
             return self._create_order("BUY", buy_price, qty)
 
-    def _strategy_stressed_market(
-        self, bid: float, ask: float, mid: float, regime: str
-    ) -> Optional[Dict]:
+    def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
         """
-        A self-contained Mean Reversion strategy for stressed markets.
-        Uses EMA for O(1) stats updates and Inventory Skew for risk management.
+        Stressed market strategy that matches your plot:
+        - Long drift + occasional violent swings.
+        So we use:
+        - EMA fair value (tracks drift)
+        - ATR-like band sizing (tracks volatility)
+        - Mean reversion ONLY when move is slowing/reversing
+        - Ladder of resting orders (hold inventory) but with "stop-add" protection
+        - Near-touch exits so you actually get out when it reverts
         """
-        # --- 1. CONFIGURATION ---
-        ALPHA = 0.05  # Decay factor (approx 20-tick memory)
-        THRESHOLD = 2.0  # Z-Score trigger (2 std devs)
-        MAX_INV = 4800  # Adjust based on your actual limit
-        QTY = 100  # Base trade size
 
-        # --- 2. DYNAMIC STATE INITIALIZATION ---
-        # This makes the function modular; no need to change __init__
-        if not hasattr(self, "_mr_ema_mid"):
-            self._mr_ema_mid = mid  # Initialize mean at current price
-            self._mr_ema_var = 0.0  # Initialize variance at 0
-            self._mr_initialized = False
-            return None  # Need at least one tick to init
+        TICK = 0.01
+        BASE_QTY = 100
 
-        # --- 3. UPDATE STATISTICS (EMA) ---
-        # Calculate deviation from the previous mean
-        delta = mid - self._mr_ema_mid
+        # --- parameters you can tune ---
+        EMA_ALPHA = 2.0 / (40.0 + 1.0)   # EMA(40) fair value (follows drift)
+        ATR_WIN = 25                     # volatility window
+        ENTRY_K = 2.2                    # entry band width (bigger = fewer knife catches)
+        EXIT_K  = 0.7                    # exit band width
+        STOP_ADD_K = 3.4                 # if deviation too extreme, stop averaging down
+        COOLDOWN = 80                    # rebuild ladder at most every N steps
 
-        # Update Exponential Moving Average (The "Fair Price")
-        self._mr_ema_mid += ALPHA * delta
+        MAX_LEVELS = 10                  # ladder depth (open orders are limited anyway)
+        MIN_LEVELS = 4
 
-        # Update Exponential Moving Variance (The "Risk/Volatility")
-        # Formula: (1-alpha) * (prev_var + alpha * delta^2)
-        self._mr_ema_var = (1 - ALPHA) * (self._mr_ema_var + ALPHA * delta**2)
+        # spacing control
+        SPACING_FRAC_ATR = 0.55          # how wide levels are spaced in stressed tape
+        FIRST_LEVEL_MULT = 1.2           # start ladder deeper away from touch
 
-        # Warm-up period: Don't trade if variance is too low (avoid div by zero)
-        if self._mr_ema_var < 1e-6:
+        # protect inventory
+        MAX_INV_TO_ADD = int(0.75 * INVENTORY_LIMIT)  # don't keep adding if already loaded
+
+        # --- lazy init ---
+        if not hasattr(self, "_sm_ema"):
+            self._sm_ema = mid
+            self._sm_atr_hist = deque(maxlen=ATR_WIN)
+            self._mr_ladder = deque()
+            self._mr_last_build_step = -999999
+            self._mr_last_z = 0.0
+
+        spread = ask - bid
+        if mid <= 0 or bid <= 0 or ask <= 0 or spread <= 0:
             return None
 
-        # --- 4. CALCULATE SIGNALS ---
-        volatility = self._mr_ema_var**0.5
+        # ---------------------------
+        # 1) Update EMA fair value
+        # ---------------------------
+        self._sm_ema = EMA_ALPHA * mid + (1.0 - EMA_ALPHA) * self._sm_ema
+        fair = self._sm_ema
 
-        # Z-Score: How many standard deviations is price away from the mean?
-        z_score = (mid - self._mr_ema_mid) / volatility
+        # ---------------------------
+        # 2) Update ATR-like volatility estimate
+        # ---------------------------
+        if len(self.price_history) >= 2:
+            dm = abs(self.price_history[-1] - self.price_history[-2])
+            self._sm_atr_hist.append(dm)
 
-        # Inventory Skew:
-        # If we are Long (+), we add to Z-score to make it look "higher", triggering a SELL sooner.
-        # If we are Short (-), we subtract from Z-score to make it look "lower", triggering a BUY sooner.
-        skew = self.inventory / MAX_INV
-        adjusted_z = z_score + skew
+        if len(self._sm_atr_hist) < max(5, ATR_WIN // 2):
+            return None
 
-        # --- 5. EXECUTION LOGIC ---
-        side = None
-        price = None
+        atr = sum(self._sm_atr_hist) / len(self._sm_atr_hist)
+        atr = max(atr, 2 * TICK)  # floor so we don't get microscopic bands
 
-        # Sell Condition: Price is statistically too high OR we have too much inventory
-        if adjusted_z > THRESHOLD:
-            side = "SELL"
-            # Place order slightly inside the spread to ensure fill in stressed liquidty
-            price = ask * 0.9995
+        # ---------------------------
+        # 3) Compute deviation "z-ish"
+        # ---------------------------
+        dev = mid - fair
+        z = dev / atr
 
-        # Buy Condition: Price is statistically too low OR we are short
-        elif adjusted_z < -THRESHOLD:
+        # momentum (to avoid fading a freight train)
+        mom = 0.0
+        if len(self.price_history) >= 3:
+            mom = self.price_history[-1] - self.price_history[-2]
+
+        last_z = self._mr_last_z
+        self._mr_last_z = z
+
+        def round_px(x: float) -> float:
+            return round(max(x, 0.01), 2)
+
+        # ---------------------------
+        # 4) Exit logic (when it reverts back toward EMA)
+        #    Use near-touch exits so you actually get filled.
+        # ---------------------------
+        if abs(z) < EXIT_K and abs(self.inventory) >= 100:
+            qty = min(abs(self.inventory), 300)
+            qty = (qty // 100) * 100
+            if qty < 100:
+                return None
+
+            if self.inventory > 0:
+                # long -> sell near touch
+                px = max(bid + TICK, ask - TICK)
+                return self._create_order("SELL", round_px(px), qty)
+            else:
+                # short -> buy near touch
+                px = min(ask - TICK, bid + TICK)
+                return self._create_order("BUY", round_px(px), qty)
+
+        # ---------------------------
+        # 5) If ladder queued, keep placing it (hold orders / build inventory)
+        # ---------------------------
+        if self._mr_ladder:
+            side, px, lvl = self._mr_ladder.popleft()
+
+            # small early size, scale gently deeper
+            qty = BASE_QTY * (1 + (lvl // 6))
+            room = INVENTORY_LIMIT - abs(self.inventory)
+            if room < 100:
+                return None
+            qty = min(qty, room)
+            qty = (qty // 100) * 100
+            if qty < 100:
+                return None
+
+            return self._create_order(side, px, qty)
+
+        # ---------------------------
+        # 6) Entry logic: build ladder ONLY at extremes
+        #    AND only if the move is slowing/reversing.
+        # ---------------------------
+        if abs(z) < ENTRY_K:
+            return None
+
+        # cooldown so we don't rebuild constantly
+        if self.current_step - self._mr_last_build_step < COOLDOWN:
+            return None
+
+        # don't average down forever in a trend
+        if abs(self.inventory) > MAX_INV_TO_ADD:
+            return None
+
+        # stop-add if it is an extreme runaway move
+        if abs(z) > STOP_ADD_K:
+            return None
+
+        # ✅ Reversal filter:
+        # If price is below fair (z < 0): only BUY if momentum stops going down OR z improves
+        # If price is above fair (z > 0): only SELL if momentum stops going up OR z improves
+        if z < 0:
+            reversal_ok = (mom >= 0) or (abs(z) < abs(last_z))
+            if not reversal_ok:
+                return None
             side = "BUY"
-            # Place order slightly above bid
-            price = bid * 1.0005
-
-        # --- 6. SAFETY & ORDER CREATION ---
-        if side:
-            # Check inventory limits before sending
-            if side == "BUY" and self.inventory + QTY > MAX_INV:
+        else:
+            reversal_ok = (mom <= 0) or (abs(z) < abs(last_z))
+            if not reversal_ok:
                 return None
-            if side == "SELL" and self.inventory - QTY < -MAX_INV:
-                return None
+            side = "SELL"
 
-            return self._create_order(side, round(price, 2), QTY)
+        # ---------------------------
+        # 7) Build ladder prices (deeper first level!)
+        # ---------------------------
+        z_mag = min(abs(z), 4.0)
+        levels = int(2 + z_mag * 2.5)          # more extreme -> deeper ladder
+        levels = max(MIN_LEVELS, min(MAX_LEVELS, levels))
 
-        return None
+        spacing = max(2 * TICK, SPACING_FRAC_ATR * atr, 0.75 * spread)
+        first_offset = FIRST_LEVEL_MULT * spacing
+
+        self._mr_ladder.clear()
+        for lvl in range(1, levels + 1):
+            if side == "BUY":
+                px = bid - (first_offset + (lvl - 1) * spacing)
+            else:
+                px = ask + (first_offset + (lvl - 1) * spacing)
+
+            self._mr_ladder.append((side, round_px(px), lvl))
+
+        self._mr_last_build_step = self.current_step
+
+        # Send first order immediately
+        side, px, lvl = self._mr_ladder.popleft()
+        qty = BASE_QTY
+
+        room = INVENTORY_LIMIT - abs(self.inventory)
+        if room < 100:
+            return None
+        qty = min(qty, room)
+        qty = (qty // 100) * 100
+        if qty < 100:
+            return None
+
+        return self._create_order(side, px, qty)
+
 
     def _strategy_hft_dominated(
         self, bid: float, ask: float, mid: float, regime: str
