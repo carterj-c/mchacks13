@@ -62,26 +62,26 @@ export default function Dashboard() {
           </ul>
 
           <p>
-            We use a multi-class XGBoost classifier trained on engineered microstructure
-            features instead of raw prices.
+            We use an XGBoost model trained on self-collected data. Engineered features allow us to predict regimes and select the best 
+            strategy for a given market state.
           </p>
 
           <p>
             Key design principles:
           </p>
           <ul>
-            <li>Relative features instead of absolute prices</li>
-            <li>Rolling statistical indicators</li>
-            <li>Regime classification instead of price prediction</li>
+            <li>Relative features instead of absolute prices (required for classification model)</li>
+            <li>Multi-duration statistical indicators for visibility on long-term market state, and low halflife events</li>
+            <li>Exploitation of our edge (speed & precision)</li>
             <li>Emphasis on stability and interpretability</li>
           </ul>
 
           <hr />
 
-          <h3>Why We Logged and Visualized the Data</h3>
+          <h3>Data Exploration</h3>
           <p>
-            We first logged market data in order to visualize it and understand what we
-            were working with. Raw price streams were too noisy to reason about directly.
+            Instead of trying to reason about the data without seeing it, we decided to log data from live runs in each regime.
+            This allowed us to visualize, engineer, and test the data more easily.
           </p>
 
           <p>
@@ -92,41 +92,46 @@ export default function Dashboard() {
 
           <p>
             The visible gaps in the charts correspond to rows containing zero values, which
-            were removed during data cleaning.
+            we did not drop from the training dataset as they would show up in testing runs.
           </p>
 
           <hr />
 
-          <h3>Data Quality Issues: Zero-Value Rows</h3>
+          <h3>Data Quality Issues</h3>
+          <h4>Zero Data Points</h4>
           <p>
-            We observed frequent rows where bid, ask, and mid prices were recorded as zero.
+            We observed frequent, peristing rows where bid, ask, and mid prices were recorded as zero.
             These segments appear to be either intentional obstacles or artifacts of the
             synthetic data generator.
           </p>
 
+          <h4>Flat Prices</h4>
           <p>
-            These invalid rows were filtered to prevent corrupting statistical features
-            and model training.
+            In the normal_market scenario the bid/ask hardly changed for the whole run, meaning all trading was
+            taking place inside the spread. This may have been intentional but a scenario where prices don't move
+            seems like it may be an artifact of data generation.
+
           </p>
 
           <hr />
 
-          <h3>Normal Market Structure Anomaly</h3>
+          <h3>Simulation Bot Behavior</h3>
+          <h4>Grid Set-Point</h4>
           <p>
-            In the normal market regime, prices barely move, yet extremely consistent profits
-            were achievable. Investigation showed that the market-making bots operate on a
-            fixed grid of approximately $0.25.
+            Bots seemed to normally act in a grid of some kind where they would only make markets in 
+            increments of $0.25. This meant that if you placed a bid/ask even basis point inside their increments,
+            the bots should just endlessly buy and sell the slightly tighter spread you offered.
+
           </p>
 
           <p>
-            By placing bids and asks slightly inside this grid, we effectively gained a
-            monopoly on liquidity provision, allowing repeated risk-free fills between
-            gridlocked bots.
+            This was particularly exasperated in the normal market regime where you could agressively make
+            the market as the spread never changed the entire run.
           </p>
 
+          <h4>Fill Time and Fill Probabilties</h4>
           <p>
-            The dataset itself was nearly constant across time, except for one column that
-            revealed a clear mean-reversion opportunity in the spread.
+            Another thing to note is the rate and latency that the bots offer you
           </p>
 
           <hr />
