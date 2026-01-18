@@ -100,3 +100,32 @@ body {
   border: none;
   border-top: 1px solid #e5e7eb;
 }
+
+.accuracy-highlight {
+  margin-top: 24px;
+  background: #111827;
+  border-radius: 14px;
+  padding: 24px;
+  color: white;
+  text-align: center;
+}
+
+.accuracy-label {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  margin-bottom: 8px;
+  color: #d1d5db;
+}
+
+.accuracy-value {
+  font-size: 64px;
+  font-weight: 700;
+  line-height: 1;
+  margin-bottom: 8px;
+}
+
+.accuracy-note {
+  font-size: 14px;
+  color: #9ca3af;
+}
