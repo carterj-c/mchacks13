@@ -20,7 +20,7 @@ import urllib3
 import pickle
 import xgboost as xgb
 from typing import Dict, Optional, Any, List
-from collections import deque
+from collections import deque, Counter  # ✅ CHANGED: added Counter
 import math
 import random
 import os
@@ -38,7 +38,7 @@ REGIME_SCENARIOS = (
 
 INVENTORY_LIMIT = 5000
 RISK_UNWIND_THRESHOLD = 1000
-RISK_UNWIND_MAX = 150
+RISK_UNWIND_MAX = 100
 
 # NEW: Max number of open/resting orders allowed by exchange (your error was 50)
 MAX_OPEN_ORDERS = 50
@@ -119,6 +119,13 @@ class TradingBot:
 
         # NEW: Track cancels that have been sent but not confirmed yet
         self.cancel_pending_set = set()
+
+        # ------------------------------------------------------------------
+        # ✅ CHANGED: Regime stabilization (prevents self-quotes from flipping regime)
+        # ------------------------------------------------------------------
+        self._regime_votes = deque(maxlen=9)
+        self._regime_current = "normal_market"
+        self._regime_lock_until = 0
 
         # Load model + metadata
         self.regime_model = self._load_regime_model(regime_model_path)
@@ -575,10 +582,36 @@ class TradingBot:
         if not regime:
             regime = self._fallback_regime_guess(bid, ask, mid)
 
+        # ---------------------------------------------------------
+        # ✅ CHANGED: Regime smoothing + hysteresis (prevents HFT flips)
+        # ---------------------------------------------------------
+        self._regime_votes.append(regime)
+        vote = Counter(self._regime_votes).most_common(1)[0][0]
+
+        if self.current_step < self._regime_lock_until:
+            regime = self._regime_current
+        else:
+            vote_count = list(self._regime_votes).count(vote)
+            needed = max(5, len(self._regime_votes) // 2 + 1)
+
+            if vote != self._regime_current and vote_count >= needed:
+                self._regime_current = vote
+
+                if vote == "stressed_market":
+                    self._regime_lock_until = self.current_step + 400
+                elif vote == "hft_dominated":
+                    self._regime_lock_until = self.current_step + 200
+                else:
+                    self._regime_lock_until = self.current_step + 250
+
+            regime = self._regime_current
+
         handler = self.regime_strategy_map.get(regime, self._strategy_normal_market)
 
         if self.current_step % 200 == 0:
-            print(f"[{self.student_id}] Regime: {regime}")
+            print(
+                f"[{self.student_id}] Regime(raw={self._regime_votes[-1]} -> smooth={regime})"
+            )
 
         return handler(bid, ask, mid, regime)
 
@@ -638,10 +671,10 @@ class TradingBot:
         # Alternate order side every time function is called
         self.flip_flop = not self.flip_flop
 
-        if self.inventory >= RISK_UNWIND_THRESHOLD-100:
+        if self.inventory >= RISK_UNWIND_THRESHOLD - 100:
             # Forced SELL if at inventory limit
             return self._create_order("SELL", sell_price, qty)
-        elif self.inventory <= -RISK_UNWIND_THRESHOLD+100:
+        elif self.inventory <= -RISK_UNWIND_THRESHOLD + 100:
             # Forced BUY if at negative inventory limit
             return self._create_order("BUY", buy_price, qty)
 
@@ -652,91 +685,118 @@ class TradingBot:
             # BUY at bid + 0.01
             return self._create_order("BUY", buy_price, qty)
 
-    def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
+    # ---------------------------------------------------------
+    # ✅ CHANGED: Entire stressed strategy replaced (v2)
+    # ---------------------------------------------------------
+    def _strategy_stressed_market(
+        self, bid: float, ask: float, mid: float, regime: str
+    ) -> Optional[Dict]:
         """
-        Stressed market strategy that matches your plot:
-        - Long drift + occasional violent swings.
-        So we use:
-        - EMA fair value (tracks drift)
-        - ATR-like band sizing (tracks volatility)
-        - Mean reversion ONLY when move is slowing/reversing
-        - Ladder of resting orders (hold inventory) but with "stop-add" protection
-        - Near-touch exits so you actually get out when it reverts
+        Stressed market strategy v2 (self-impact safe + trend-aware)
+
+        Goals:
+        - Do NOT create HFT-looking tight spreads (avoid quoting inside)
+        - Capture mean-reversion *when it is safe*
+        - Don't average into runaway drift
+        - Exit by taking liquidity (hit bid / lift ask), not tightening inside spread
         """
 
         TICK = 0.01
         BASE_QTY = 100
 
-        # --- parameters you can tune ---
-        EMA_ALPHA = 2.0 / (40.0 + 1.0)   # EMA(40) fair value (follows drift)
-        ATR_WIN = 25                     # volatility window
-        ENTRY_K = 2.2                    # entry band width (bigger = fewer knife catches)
-        EXIT_K  = 0.7                    # exit band width
-        STOP_ADD_K = 3.4                 # if deviation too extreme, stop averaging down
-        COOLDOWN = 80                    # rebuild ladder at most every N steps
+        # --- tuned parameters ---
+        EMA_ALPHA = 2.0 / (50.0 + 1.0)  # smoother fair value
+        ATR_WIN = 30
+        ENTRY_K = 2.6  # wider bands => fewer knife catches
+        EXIT_K = 0.9
+        STOP_ADD_K = 3.8  # stop adding if deviation is extreme
+        COOLDOWN = 90
 
-        MAX_LEVELS = 10                  # ladder depth (open orders are limited anyway)
+        TREND_WIN = 18  # drift detection window
+        TREND_K = 0.75  # scales ATR into trend threshold
+
+        MAX_LEVELS = 9
         MIN_LEVELS = 4
 
-        # spacing control
-        SPACING_FRAC_ATR = 0.55          # how wide levels are spaced in stressed tape
-        FIRST_LEVEL_MULT = 1.2           # start ladder deeper away from touch
+        # ladder spacing
+        SPACING_FRAC_ATR = 0.60
+        FIRST_LEVEL_MULT = 1.4
 
-        # protect inventory
-        MAX_INV_TO_ADD = int(0.75 * INVENTORY_LIMIT)  # don't keep adding if already loaded
+        # inventory protection
+        MAX_INV_TO_ADD = int(0.60 * INVENTORY_LIMIT)
+        PANIC_UNWIND_INV = int(0.80 * INVENTORY_LIMIT)
 
-        # --- lazy init ---
-        if not hasattr(self, "_sm_ema"):
-            self._sm_ema = mid
-            self._sm_atr_hist = deque(maxlen=ATR_WIN)
-            self._mr_ladder = deque()
-            self._mr_last_build_step = -999999
-            self._mr_last_z = 0.0
-
+        if mid <= 0 or bid <= 0 or ask <= 0:
+            return None
         spread = ask - bid
-        if mid <= 0 or bid <= 0 or ask <= 0 or spread <= 0:
+        if spread <= 0:
             return None
 
         # ---------------------------
-        # 1) Update EMA fair value
+        # lazy init
         # ---------------------------
-        self._sm_ema = EMA_ALPHA * mid + (1.0 - EMA_ALPHA) * self._sm_ema
-        fair = self._sm_ema
+        if not hasattr(self, "_sm2_ema"):
+            self._sm2_ema = mid
+            self._sm2_atr_hist = deque(maxlen=ATR_WIN)
+            self._sm2_ladder = deque()
+            self._sm2_last_build_step = -999999
+            self._sm2_last_z = 0.0
 
         # ---------------------------
-        # 2) Update ATR-like volatility estimate
+        # Update EMA fair value
+        # ---------------------------
+        self._sm2_ema = EMA_ALPHA * mid + (1.0 - EMA_ALPHA) * self._sm2_ema
+        fair = self._sm2_ema
+
+        # ---------------------------
+        # ATR-like volatility
         # ---------------------------
         if len(self.price_history) >= 2:
             dm = abs(self.price_history[-1] - self.price_history[-2])
-            self._sm_atr_hist.append(dm)
+            self._sm2_atr_hist.append(dm)
 
-        if len(self._sm_atr_hist) < max(5, ATR_WIN // 2):
+        if len(self._sm2_atr_hist) < max(8, ATR_WIN // 2):
             return None
 
-        atr = sum(self._sm_atr_hist) / len(self._sm_atr_hist)
-        atr = max(atr, 2 * TICK)  # floor so we don't get microscopic bands
+        atr = sum(self._sm2_atr_hist) / len(self._sm2_atr_hist)
+        atr = max(atr, 3 * TICK)
 
         # ---------------------------
-        # 3) Compute deviation "z-ish"
+        # Trend estimate (drift)
+        # ---------------------------
+        trend = 0.0
+        if len(self.price_history) >= TREND_WIN:
+            trend = (self.price_history[-1] - self.price_history[-TREND_WIN]) / TREND_WIN
+
+        trend_thr = TREND_K * (atr / max(TREND_WIN, 1))
+
+        # ---------------------------
+        # Deviation in ATR units
         # ---------------------------
         dev = mid - fair
         z = dev / atr
-
-        # momentum (to avoid fading a freight train)
-        mom = 0.0
-        if len(self.price_history) >= 3:
-            mom = self.price_history[-1] - self.price_history[-2]
-
-        last_z = self._mr_last_z
-        self._mr_last_z = z
+        last_z = self._sm2_last_z
+        self._sm2_last_z = z
 
         def round_px(x: float) -> float:
             return round(max(x, 0.01), 2)
 
-        # ---------------------------
-        # 4) Exit logic (when it reverts back toward EMA)
-        #    Use near-touch exits so you actually get filled.
-        # ---------------------------
+        # ==========================================================
+        # 1) PANIC UNWIND (if loaded + move is wrong way)
+        # ==========================================================
+        if abs(self.inventory) >= PANIC_UNWIND_INV:
+            # take liquidity to reduce risk NOW (no inside quoting)
+            qty = min(abs(self.inventory), 400)
+            qty = (qty // 100) * 100
+            if qty >= 100:
+                if self.inventory > 0:
+                    return self._create_order("SELL", round_px(bid), qty)  # hit bid
+                else:
+                    return self._create_order("BUY", round_px(ask), qty)  # lift ask
+
+        # ==========================================================
+        # 2) Exit logic (take-liquidity exit so you don't tighten spread)
+        # ==========================================================
         if abs(z) < EXIT_K and abs(self.inventory) >= 100:
             qty = min(abs(self.inventory), 300)
             qty = (qty // 100) * 100
@@ -744,54 +804,64 @@ class TradingBot:
                 return None
 
             if self.inventory > 0:
-                # long -> sell near touch
-                px = max(bid + TICK, ask - TICK)
-                return self._create_order("SELL", round_px(px), qty)
+                return self._create_order("SELL", round_px(bid), qty)  # hit bid
             else:
-                # short -> buy near touch
-                px = min(ask - TICK, bid + TICK)
-                return self._create_order("BUY", round_px(px), qty)
+                return self._create_order("BUY", round_px(ask), qty)  # lift ask
 
-        # ---------------------------
-        # 5) If ladder queued, keep placing it (hold orders / build inventory)
-        # ---------------------------
-        if self._mr_ladder:
-            side, px, lvl = self._mr_ladder.popleft()
+        # ==========================================================
+        # 3) If ladder exists, keep placing it (always OUTSIDE book)
+        # ==========================================================
+        if self._sm2_ladder:
+            side, px, lvl = self._sm2_ladder.popleft()
 
-            # small early size, scale gently deeper
-            qty = BASE_QTY * (1 + (lvl // 6))
             room = INVENTORY_LIMIT - abs(self.inventory)
             if room < 100:
                 return None
+
+            qty = BASE_QTY * (1 + (lvl // 5))
             qty = min(qty, room)
             qty = (qty // 100) * 100
             if qty < 100:
                 return None
 
-            return self._create_order(side, px, qty)
+            # Safety: ensure ladder quotes do NOT improve top-of-book
+            if side == "BUY":
+                px = min(px, bid - TICK)
+            else:
+                px = max(px, ask + TICK)
 
-        # ---------------------------
-        # 6) Entry logic: build ladder ONLY at extremes
-        #    AND only if the move is slowing/reversing.
-        # ---------------------------
+            return self._create_order(side, round_px(px), qty)
+
+        # ==========================================================
+        # 4) Entry trigger (extreme deviation)
+        # ==========================================================
         if abs(z) < ENTRY_K:
             return None
 
-        # cooldown so we don't rebuild constantly
-        if self.current_step - self._mr_last_build_step < COOLDOWN:
+        if self.current_step - self._sm2_last_build_step < COOLDOWN:
             return None
 
-        # don't average down forever in a trend
         if abs(self.inventory) > MAX_INV_TO_ADD:
             return None
 
-        # stop-add if it is an extreme runaway move
         if abs(z) > STOP_ADD_K:
             return None
 
-        # ✅ Reversal filter:
-        # If price is below fair (z < 0): only BUY if momentum stops going down OR z improves
-        # If price is above fair (z > 0): only SELL if momentum stops going up OR z improves
+        # ==========================================================
+        # 5) Trend filter (do NOT fade a freight train)
+        # ==========================================================
+        # If mid is BELOW fair (want BUY), but trend is strongly DOWN => skip
+        # If mid is ABOVE fair (want SELL), but trend is strongly UP => skip
+        if z < 0 and trend < -trend_thr:
+            return None
+        if z > 0 and trend > trend_thr:
+            return None
+
+        # Reversal confirmation: z improving or momentum slowing
+        mom = 0.0
+        if len(self.price_history) >= 3:
+            mom = self.price_history[-1] - self.price_history[-2]
+
         if z < 0:
             reversal_ok = (mom >= 0) or (abs(z) < abs(last_z))
             if not reversal_ok:
@@ -803,41 +873,41 @@ class TradingBot:
                 return None
             side = "SELL"
 
-        # ---------------------------
-        # 7) Build ladder prices (deeper first level!)
-        # ---------------------------
+        # ==========================================================
+        # 6) Build ladder levels (deeper first level, outside book)
+        # ==========================================================
         z_mag = min(abs(z), 4.0)
-        levels = int(2 + z_mag * 2.5)          # more extreme -> deeper ladder
+        levels = int(2 + z_mag * 2.3)
         levels = max(MIN_LEVELS, min(MAX_LEVELS, levels))
 
-        spacing = max(2 * TICK, SPACING_FRAC_ATR * atr, 0.75 * spread)
+        spacing = max(3 * TICK, SPACING_FRAC_ATR * atr, 0.80 * spread)
         first_offset = FIRST_LEVEL_MULT * spacing
 
-        self._mr_ladder.clear()
+        self._sm2_ladder.clear()
         for lvl in range(1, levels + 1):
             if side == "BUY":
                 px = bid - (first_offset + (lvl - 1) * spacing)
+                px = min(px, bid - TICK)  # never inside
             else:
                 px = ask + (first_offset + (lvl - 1) * spacing)
+                px = max(px, ask + TICK)  # never inside
 
-            self._mr_ladder.append((side, round_px(px), lvl))
+            self._sm2_ladder.append((side, round_px(px), lvl))
 
-        self._mr_last_build_step = self.current_step
+        self._sm2_last_build_step = self.current_step
 
-        # Send first order immediately
-        side, px, lvl = self._mr_ladder.popleft()
-        qty = BASE_QTY
+        # Send first immediately
+        side, px, lvl = self._sm2_ladder.popleft()
 
         room = INVENTORY_LIMIT - abs(self.inventory)
         if room < 100:
             return None
-        qty = min(qty, room)
+        qty = min(BASE_QTY, room)
         qty = (qty // 100) * 100
         if qty < 100:
             return None
 
-        return self._create_order(side, px, qty)
-
+        return self._create_order(side, round_px(px), qty)
 
     def _strategy_hft_dominated(
         self, bid: float, ask: float, mid: float, regime: str
