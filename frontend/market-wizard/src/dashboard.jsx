@@ -69,7 +69,7 @@ export default function Dashboard() {
           </ul>
 
           <div className="accuracy-highlight">
-            <div className="accuracy-label">Regime Detection Testing</div>
+            <div className="accuracy-label">Regime Detection Validation Accuracy</div>
             <div className="accuracy-value">100%</div>
             <div className="accuracy-note">
               Specialized models hit 100% accuracy on held-out regime data before deployment.
