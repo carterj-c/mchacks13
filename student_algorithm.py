@@ -587,39 +587,39 @@ class TradingBot:
         price = min(ask + 0.01, ask + 0.03)
         return self._create_order("BUY", price, qty)
 
-    def _strategy_normal_market(
-        self, bid: float, ask: float, mid: float, regime: str
-    ) -> Optional[Dict]:
+    def _strategy_normal_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
         """
-        Implementation of SPRAY AND PRAY
+        Normal market strategy:
+        Alternate forever:
+        1) SELL at (ask - 0.01)
+        2) BUY  at (bid + 0.01)
         """
 
-        # 2. Price Calculation (Adaptive Anti-Spiral)
-        # Check if we are already the top of book. If so, reinforce. If not, jump.
-        if abs(bid - self.my_last_bid) < 0.001:
-            my_bid = bid
-        else:
-            my_bid = round(bid + 0.01, 2)
-
-        if abs(ask - self.my_last_ask) < 0.001:
-            my_ask = ask
-        else:
-            my_ask = round(ask - 0.01, 2)
-
-        # Spread Safety
-        if my_bid >= my_ask:
-            return None
-
-        # 3. Execution (Alternating Fire)
-        self.flip_flop = not self.flip_flop
+        TICK = 0.01
         qty = 100
 
+        # Safety check
+        if bid <= 0 or ask <= 0:
+            return None
+
+        sell_price = round(ask - TICK, 2)
+        buy_price  = round(bid + TICK, 2)
+
+        # Prevent crossing / invalid spread
+        # If spread is too tight, these would cross (buy >= sell), so do nothing.
+        if buy_price >= sell_price:
+            return None
+
+        # Alternate order side every time function is called
+        self.flip_flop = not self.flip_flop
+
         if self.flip_flop:
-            self.my_last_bid = my_bid
-            return self._create_order("BUY", my_bid, qty)
+            # SELL at ask - 0.01
+            return self._create_order("SELL", sell_price, qty)
         else:
-            self.my_last_ask = my_ask
-            return self._create_order("SELL", my_ask, qty)
+            # BUY at bid + 0.01
+            return self._create_order("BUY", buy_price, qty)
+
 
     def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
         # Trade rarely in stressed mode
