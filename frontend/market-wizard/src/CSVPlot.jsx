@@ -70,7 +70,20 @@ function CSVPlot() {
       <p
         style={{
           textAlign: "center",
-          marginTop: "-10px",
+          marginTop: "-6px",
+          marginBottom: "8px",
+          color: "#444",
+          fontSize: "17px",
+          fontWeight: "500",
+        }}
+      >
+        We logged high-frequency market data to analyze price microstructure and better understand regime behavior across different market conditions.
+      </p>
+
+      <p
+        style={{
+          textAlign: "center",
+          marginTop: "0px",
           marginBottom: "30px",
           color: "#777",
           fontSize: "14px",
@@ -78,6 +91,7 @@ function CSVPlot() {
       >
         Note: Small gaps in some charts occur where invalid zero-price rows were removed during data cleaning.
       </p>
+
 
       {Object.entries(datasets).map(([label, data]) => {
         const step = data.map((r) => r.step);
