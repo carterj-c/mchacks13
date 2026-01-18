@@ -22,6 +22,7 @@ import xgboost as xgb
 from typing import Dict, Optional, Any, List
 from collections import deque
 import math
+import random
 import os
 
 # Suppress SSL warnings for self-signed certificates
@@ -617,24 +618,46 @@ class TradingBot:
         return self._create_order("SELL", price, qty)
 
     def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
-        momentum = self._recent_momentum()
-        if abs(momentum) < 0.01 * mid:
+        """
+        The Goofy Gambler 3.0: Now with a strict 15,000-step budget.
+        """
+        # 1. THE AGGRESSIVE THROTTLE
+        # Only trade once every 300 steps. 
+        # 15,000 steps / 300 = 50 orders total. 
+        # This mathematically guarantees we NEVER hit the '50 open orders' error.
+        if self.current_step % 300 != 0:
             return None
 
-        small_tick = max(0.01, mid * 0.001)
-        qty = 60
+        qty = 100
+        
+        # 2. THE CHAOS SPREAD
+        # We want these to be "lottery tickets." 
+        # Offset is 0.5% to 2.0% away from mid.
+        offset = mid * random.uniform(0.005, 0.02)
+        
+        # 3. SMART WEIGHTING
+        # If we have inventory, we try to exit it. If not, we flip a coin.
+        if self.inventory > 0:
+            side = "SELL"
+            price = ask + offset
+        elif self.inventory < 0:
+            side = "BUY"
+            price = bid - offset
+        else:
+            # No inventory? Flip for a direction!
+            if random.random() > 0.5:
+                side = "BUY"
+                price = bid - offset
+            else:
+                side = "SELL"
+                price = ask + offset
 
-        if momentum > 0:
-            price = min(ask + small_tick, ask + 0.03)
-            return self._create_order("BUY", price, qty)
-
-        price = max(bid - small_tick, bid - 0.03)
-        return self._create_order("SELL", price, qty)
+        # Round to 2 decimals for the exchange
+        return self._create_order(side, round(price, 2), qty)
 
     def _strategy_hft_dominated(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
-        print(ask)
-        if ask == 1000.3:
-            return self._create_order("BUY", ask, 200)
+        
+        return self._create_order("BUY", ask, 2000)
 
     # =========================================================================
     # ORDER HANDLING
