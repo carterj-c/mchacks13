@@ -46,7 +46,7 @@ function CSVPlot() {
 
   return (
     <div style={{ width: "95%", margin: "auto" }}>
-      <h1>Market Wizard — Market Regime Visualizer</h1>
+      <h1>Market Regime Visualizer</h1>
 
       {Object.entries(datasets).map(([label, data]) => {
         const step = data.map((r) => r.step);
