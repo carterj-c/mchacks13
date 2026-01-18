@@ -129,3 +129,10 @@ body {
   font-size: 14px;
   color: #9ca3af;
 }
+
+.insights img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 20px auto;
+}
