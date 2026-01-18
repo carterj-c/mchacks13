@@ -3,11 +3,11 @@ import Plot from "react-plotly.js";
 import Papa from "papaparse";
 
 const FILES = {
-  "Normal Market": "/data/training_data_normal_market.csv",
-  "Stressed Market": "/data/training_data_stressed_market.csv",
-  "HFT Dominated": "/data/training_data_hft_dominated.csv",
-  "Flash Crash": "/data/training_data_flash_crash.csv",
-  "Mini Flash Crash": "/data/training_data_mini_flash_crash.csv",
+  "Normal Market": "/data/received_trades_team_alpha_normal_market.csv",
+  "Stressed Market": "/data/received_trades_team_alpha_stressed_market.csv",
+  "HFT Dominated": "/data/received_trades_team_alpha_hft_dominated.csv",
+  "Flash Crash": "/data/received_trades_team_alpha_flash_crash.csv",
+  "Mini Flash Crash": "/data/received_trades_team_alpha_mini_flash_crash.csv",
 };
 
 const PNL_FILES = {
