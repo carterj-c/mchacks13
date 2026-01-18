@@ -122,9 +122,9 @@ class TradingBot:
         }
 
         # EXACT feature-engineering state (rolling/EMA)
-        self._mid_hist = deque(maxlen=60)         # supports rolling(50), rolling(20)
+        self._mid_hist = deque(maxlen=60)  # supports rolling(50), rolling(20)
         self._spread_rel_hist = deque(maxlen=60)  # supports rolling mean(50)
-        self._velocity_ema = None                # EMA(span=20, adjust=False)
+        self._velocity_ema = None  # EMA(span=20, adjust=False)
 
     # =========================================================================
     # REGISTRATION
@@ -139,10 +139,7 @@ class TradingBot:
                 headers["X-Team-Password"] = self.password
 
             resp = requests.get(
-                url,
-                headers=headers,
-                timeout=10,
-                verify=not self.secure
+                url, headers=headers, timeout=10, verify=not self.secure
             )
 
             if resp.status_code != 200:
@@ -172,13 +169,15 @@ class TradingBot:
         try:
             sslopt = {"cert_reqs": ssl.CERT_NONE} if self.secure else None
 
-            market_url = f"{self.ws_proto}://{self.host}/api/ws/market?run_id={self.run_id}"
+            market_url = (
+                f"{self.ws_proto}://{self.host}/api/ws/market?run_id={self.run_id}"
+            )
             self.market_ws = websocket.WebSocketApp(
                 market_url,
                 on_message=self._on_market_data,
                 on_error=self._on_error,
                 on_close=self._on_close,
-                on_open=lambda ws: print(f"[{self.student_id}] Market data connected")
+                on_open=lambda ws: print(f"[{self.student_id}] Market data connected"),
             )
 
             order_url = f"{self.ws_proto}://{self.host}/api/ws/orders?token={self.token}&run_id={self.run_id}"
@@ -187,11 +186,15 @@ class TradingBot:
                 on_message=self._on_order_response,
                 on_error=self._on_error,
                 on_close=self._on_close,
-                on_open=lambda ws: print(f"[{self.student_id}] Order entry connected")
+                on_open=lambda ws: print(f"[{self.student_id}] Order entry connected"),
             )
 
-            threading.Thread(target=lambda: self.market_ws.run_forever(sslopt=sslopt), daemon=True).start()
-            threading.Thread(target=lambda: self.order_ws.run_forever(sslopt=sslopt), daemon=True).start()
+            threading.Thread(
+                target=lambda: self.market_ws.run_forever(sslopt=sslopt), daemon=True
+            ).start()
+            threading.Thread(
+                target=lambda: self.order_ws.run_forever(sslopt=sslopt), daemon=True
+            ).start()
 
             time.sleep(1)
             return True
@@ -208,6 +211,17 @@ class TradingBot:
         try:
             recv_time = time.time()
             data = json.loads(message)
+            step = data.get("step", 0)
+
+            if not hasattr(self, "first_step_seen"):
+                self.first_step_seen = True
+                print(
+                    f"\n[{self.student_id}] !!! FIRST PACKET RECEIVED !!! Step: {step}"
+                )
+                if step > 3:
+                    print(
+                        f"[{self.student_id}] CONCLUSION: We missed the anomaly (Row 3). Latency is the killer.\n"
+                    )
 
             if data.get("type") == "CONNECTED":
                 return
@@ -221,8 +235,12 @@ class TradingBot:
             self.last_ask = data.get("ask", 0.0)
 
             if self.current_step % 500 == 0 and self.step_latencies:
-                avg_lat = sum(self.step_latencies[-100:]) / min(len(self.step_latencies), 100)
-                print(f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms")
+                avg_lat = sum(self.step_latencies[-100:]) / min(
+                    len(self.step_latencies), 100
+                )
+                print(
+                    f"[{self.student_id}] Step {self.current_step} | Orders: {self.orders_sent} | Inv: {self.inventory} | Avg Latency: {avg_lat:.1f}ms"
+                )
 
             if self.last_bid > 0 and self.last_ask > 0:
                 self.last_mid = (self.last_bid + self.last_ask) / 2
@@ -238,7 +256,12 @@ class TradingBot:
 
             order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
 
-            if order and self.order_ws and self.order_ws.sock and self._can_send_order():
+            if (
+                order
+                and self.order_ws
+                and self.order_ws.sock
+                and self._can_send_order()
+            ):
                 self._send_order(order)
 
             self._send_done()
@@ -301,7 +324,9 @@ class TradingBot:
                 "spread_ma_50",
                 "spread_ratio",
             ]
-            print(f"[{self.student_id}] No meta file found. Using fallback label order: {self._label_classes}")
+            print(
+                f"[{self.student_id}] No meta file found. Using fallback label order: {self._label_classes}"
+            )
             return
 
         try:
@@ -327,7 +352,9 @@ class TradingBot:
             ]
 
             print(f"[{self.student_id}] Loaded metadata from {meta_path}")
-            print(f"[{self.student_id}] Label classes (id->name): {self._label_classes}")
+            print(
+                f"[{self.student_id}] Label classes (id->name): {self._label_classes}"
+            )
             print(f"[{self.student_id}] Feature order: {self._feature_names}")
 
         except Exception as exc:
@@ -418,7 +445,9 @@ class TradingBot:
         if self._velocity_ema is None:
             self._velocity_ema = mid_change_abs
         else:
-            self._velocity_ema = alpha * mid_change_abs + (1.0 - alpha) * self._velocity_ema
+            self._velocity_ema = (
+                alpha * mid_change_abs + (1.0 - alpha) * self._velocity_ema
+            )
 
         vol_20 = self._rolling_std(self._mid_hist, 20)
         vol_50 = self._rolling_std(self._mid_hist, 50)
@@ -455,7 +484,11 @@ class TradingBot:
             pass
         try:
             # numpy array -> item()
-            if hasattr(pred, "shape") and hasattr(pred, "item") and getattr(pred, "shape", ()) != ():
+            if (
+                hasattr(pred, "shape")
+                and hasattr(pred, "item")
+                and getattr(pred, "shape", ()) != ()
+            ):
                 if getattr(pred, "size", 1) == 1:
                     return float(pred.item())
         except Exception:
@@ -572,38 +605,115 @@ class TradingBot:
     def _create_order(self, side: str, price: float, qty: int) -> Dict:
         return {"side": side, "price": round(max(price, 0.01), 2), "qty": qty}
 
-    def _risk_manage_inventory(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
+    def _risk_manage_inventory(
+        self, bid: float, ask: float, mid: float
+    ) -> Optional[Dict]:
         exposure = self.inventory
-        if abs(exposure) <= RISK_UNWIND_THRESHOLD:
+
+        if abs(exposure) < 100:
             return None
 
-        qty = min(abs(exposure) - RISK_UNWIND_THRESHOLD, RISK_UNWIND_MAX)
-        qty = max(qty, 1)
+        qty = 100
 
         if exposure > 0:
             price = max(bid - 0.01, 0.01)
             return self._create_order("SELL", price, qty)
 
-        price = min(ask + 0.01, ask + 0.03)
-        return self._create_order("BUY", price, qty)
-
-    def _strategy_normal_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
-        momentum = self._recent_momentum()
-        threshold = 0.0025 * mid
-        if abs(momentum) < threshold:
-            return None
-
-        small_tick = max(0.01, mid * 0.0005)
-        qty = 100
-
-        if momentum > 0:
-            price = min(ask + small_tick, ask + 0.05)
+        else:
+            price = ask + 0.01
             return self._create_order("BUY", price, qty)
 
-        price = max(bid - small_tick, bid - 0.05)
-        return self._create_order("SELL", price, qty)
+    def _strategy_normal_market(
+        self, bid: float, ask: float, mid: float, regime: str
+    ) -> Optional[Dict]:
+        """
+        Strategy: Penny Jumping (Tick Size Arbitrage)
+        Why: Bots are locked to 0.25 grid. We jump in front of them by 0.01 to steal priority.
+        """
+        # ------------------------------------------------------------------
+        # 1. STATE & FILLS
+        # ------------------------------------------------------------------
+        if not hasattr(self, "orders_placed"):
+            self.orders_placed = False
+            self.last_known_inventory = self.inventory
 
-    def _strategy_stressed_market(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
+        if self.inventory != self.last_known_inventory:
+            change = self.inventory - self.last_known_inventory
+            print(
+                f"[{self.student_id}] >>> FILL! Delta: {change} | Inv: {self.inventory}"
+            )
+            self.last_known_inventory = self.inventory
+            # If we fill, we generally want to hold for the other side to fill,
+            # but in a continuous bot, we might want to keep the order active.
+            # For this simplified template, we'll rely on the existing orders or 'orders_placed' logic.
+
+        # ------------------------------------------------------------------
+        # 2. RISK MANAGER (Unwind if too heavy)
+        # ------------------------------------------------------------------
+        # If we accumulate too much, dump it to the bots at their grid price
+        if abs(self.inventory) > 2000:
+            # If Long, Sell at Bid (Bot's Bid) -> Immediate Fill
+            if self.inventory > 0:
+                return self._create_order("SELL", bid, 200)
+            # If Short, Buy at Ask (Bot's Ask) -> Immediate Fill
+            else:
+                return self._create_order("BUY", ask, 200)
+
+        # ------------------------------------------------------------------
+        # 3. IDENTIFY THE BOT WALLS
+        # ------------------------------------------------------------------
+        # The bots are at the current best Bid/Ask (assuming they are 0.25 aligned)
+        # We verify this roughly
+
+        # Bot's Bid (The Wall)
+        bot_bid = bid
+        # Bot's Ask (The Wall)
+        bot_ask = ask
+
+        # ------------------------------------------------------------------
+        # 4. PENNY JUMPING EXECUTION
+        # ------------------------------------------------------------------
+        # We want to be Best Bid + 0.01 and Best Ask - 0.01
+        # BUT only if that doesn't cross the spread (which would lose money).
+
+        my_bid = bot_bid + 0.01
+        my_ask = bot_ask - 0.01
+
+        spread = my_ask - my_bid
+
+        # Safety: If jumping closes the spread too much, back off or just join.
+        # Ideally spread > 0.05 to make it worth it.
+        if spread < 0.02:
+            return None  # Market too tight to jump
+
+        # Override Rate Limit to get both orders in
+        self.order_limit_max = 100
+
+        # Place the orders (One time setup, or refresh if not active)
+        if not self.orders_placed:
+            print(
+                f"[{self.student_id}] JUMPING BOTS: Bid:{my_bid:.2f} / Ask:{my_ask:.2f} (Spread:{spread:.2f})"
+            )
+
+            if not hasattr(self, "setup_stage"):
+                self.setup_stage = "BID"
+
+            qty = 100  # Start small to verify
+
+            if self.setup_stage == "BID":
+                self.setup_stage = "ASK"
+                return self._create_order("BUY", my_bid, qty)
+
+            elif self.setup_stage == "ASK":
+                self.setup_stage = "DONE"
+                self.orders_placed = True
+                return self._create_order("SELL", my_ask, qty)
+
+        return None
+
+    def _strategy_stressed_market(
+        self, bid: float, ask: float, mid: float, regime: str
+    ) -> Optional[Dict]:
         momentum = self._recent_momentum()
         if abs(momentum) < 0.01 * mid:
             return None
@@ -618,7 +728,9 @@ class TradingBot:
         price = max(bid - small_tick, bid - 0.03)
         return self._create_order("SELL", price, qty)
 
-    def _strategy_hft_dominated(self, bid: float, ask: float, mid: float, regime: str) -> Optional[Dict]:
+    def _strategy_hft_dominated(
+        self, bid: float, ask: float, mid: float, regime: str
+    ) -> Optional[Dict]:
         momentum = self._recent_momentum()
         if abs(momentum) < 0.0015 * mid:
             return None
@@ -639,7 +751,12 @@ class TradingBot:
 
     def _send_order(self, order: Dict):
         order_id = f"ORD_{self.student_id}_{self.current_step}_{self.orders_sent}"
-        msg = {"order_id": order_id, "side": order["side"], "price": order["price"], "qty": order["qty"]}
+        msg = {
+            "order_id": order_id,
+            "side": order["side"],
+            "price": order["price"],
+            "qty": order["qty"],
+        }
         try:
             self.order_send_times[order_id] = time.time()
             self.order_ws.send(json.dumps(msg))
@@ -691,7 +808,9 @@ class TradingBot:
 
                 self.pnl = self.cash_flow + self.inventory * self.last_mid
 
-                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}")
+                print(
+                    f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}"
+                )
 
             elif msg_type == "ERROR":
                 print(f"[{self.student_id}] ERROR: {data.get('message')}")
@@ -743,13 +862,17 @@ class TradingBot:
                 print(f"\n  Step Latency (ms):")
                 print(f"    Min: {min(self.step_latencies):.1f}")
                 print(f"    Max: {max(self.step_latencies):.1f}")
-                print(f"    Avg: {sum(self.step_latencies)/len(self.step_latencies):.1f}")
+                print(
+                    f"    Avg: {sum(self.step_latencies) / len(self.step_latencies):.1f}"
+                )
 
             if self.fill_latencies:
                 print(f"\n  Fill Latency (ms):")
                 print(f"    Min: {min(self.fill_latencies):.1f}")
                 print(f"    Max: {max(self.fill_latencies):.1f}")
-                print(f"    Avg: {sum(self.fill_latencies)/len(self.fill_latencies):.1f}")
+                print(
+                    f"    Avg: {sum(self.fill_latencies) / len(self.fill_latencies):.1f}"
+                )
 
 
 # =============================================================================
@@ -767,16 +890,26 @@ Examples:
 
   Deployed server (HTTPS):
     python student_algorithm.py --name team_alpha --password secret123 --scenario normal_market --host 3.98.52.120:8433 --secure
-        """
+        """,
     )
 
     parser.add_argument("--name", required=True, help="Your team name")
     parser.add_argument("--password", required=True, help="Your team password")
     parser.add_argument("--scenario", default="normal_market", help="Scenario to run")
     parser.add_argument("--host", default="localhost:8080", help="Server host:port")
-    parser.add_argument("--secure", action="store_true", help="Use HTTPS/WSS (for deployed servers)")
-    parser.add_argument("--regime-model", default="market_classifier_crator.pkl", help="Path to a pretrained regime classification model")
-    parser.add_argument("--regime-meta", default=None, help="Path to metadata pickle (classes + feature_names) from training")
+    parser.add_argument(
+        "--secure", action="store_true", help="Use HTTPS/WSS (for deployed servers)"
+    )
+    parser.add_argument(
+        "--regime-model",
+        default="market_classifier_crator.pkl",
+        help="Path to a pretrained regime classification model",
+    )
+    parser.add_argument(
+        "--regime-meta",
+        default=None,
+        help="Path to metadata pickle (classes + feature_names) from training",
+    )
     args = parser.parse_args()
 
     bot = TradingBot(
@@ -788,5 +921,5 @@ Examples:
         regime_model_path=args.regime_model,
         regime_meta_path=args.regime_meta,
     )
-    
+
     bot.run()
