@@ -73,7 +73,7 @@ function CSVPlot() {
                 { x: step, y: midMin, type: "scatter", mode: "lines", name: "Mid Min (20)", line: { dash: "dash", color: "blue" } },
                 { x: step, y: midMax, type: "scatter", mode: "lines", name: "Mid Max (20)", line: { dash: "dash", color: "blue" } },
                 { x: step, y: bid, type: "scatter", mode: "lines", name: "Bid", line: { color: "green" }, opacity: 0.5 },
-                { x: step, y: ask, type: "scatter", mode: "lines", name: "Ask", line: { color: "red" }, opacity: 0.5 },
+                { x: step, y: ask, type: "scatter", mode: "lines", name: "Ask", line: { color: "#c8102e" }, opacity: 0.5 },
               ]}
               layout={{
                 title: `${label} — Bid / Ask / Mid Structure`,

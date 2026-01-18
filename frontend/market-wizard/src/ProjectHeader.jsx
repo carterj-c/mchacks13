@@ -4,17 +4,15 @@ function ProjectHeader() {
   return (
     <div
     style={{
-    background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
-    color: "white",
-    padding: "50px 40px",
-    borderRadius: "12px",
-    margin: "30px auto 50px auto",
-    maxWidth: "1100px",
-    width: "90%",
-    boxShadow: "0 8px 24px rgba(0,0,0,0.25)",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
+      background: "#c8102e", // Red gradient
+      color: "white", // White text
+      padding: "50px 40px",
+      width: "90vw",
+      boxShadow: "0 8px 24px rgba(0,0,0,0.25)", // Keep subtle shadow
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif", // Corporate font
     }}
     >  
       {/* LEFT: Project Overview */}
